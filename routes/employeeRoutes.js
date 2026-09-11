@@ -361,7 +361,7 @@ router.get(`${API_BASE}/checktypes`, async (req, res) => {
 });
 
 // Get Single Check Type
-router.get(`${API_BASE}/api/checktypes/:id`, async (req, res) => {
+router.get(`${API_BASE}/checktypes/:id`, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, message: "Invalid check type ID" });
