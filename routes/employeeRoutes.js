@@ -298,7 +298,7 @@ const SUBCHECKTYPE_COLLECTION = "sub-checktype-creation";
    ════════════════════════════════════════════════════════════════════ */
 
 // Create Check Type
-router.post(`${API_BASE}/checktype`, async (req, res) => {
+router.post(`${API_BASE}/checktype/create`, async (req, res) => {
   try {
     const {
       code, name, description, sla,
