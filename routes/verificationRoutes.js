@@ -120,7 +120,7 @@ const EFFECTIVE_FIELDS_STAGE = {
    Feeds both the dashboard cards AND the "Verification Type"
    filter dropdown on the Overall Verification tab.
 ------------------------------------------------------------ */
-router.get(`${API_BASE}/verifications/checktypes`, async (req, res) => {
+router.get('api/verifications/checktypes', async (req, res) => {
   try {
     const checkTypes = await req.db
       .collection(CHECKTYPE_COLLECTION)
