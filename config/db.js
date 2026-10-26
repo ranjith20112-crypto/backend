@@ -1,29 +1,42 @@
-// config/db.js
+import axios from "axios";
 
-const { MongoClient } = require("mongodb");
+export const API_URL = "https://task-backend-mn8a.onrender.com";
+export const LOGIN_API = "/api/auth/login";
 
-const client = new MongoClient(process.env.MONGO_URI);
+const API = axios.create({
+  baseURL: API_URL,
+  headers: {
+    "Content-Type": "application/json",
+  },
+});
 
-let db;
+API.interceptors.request.use(
+  (config) => {
+    const token = localStorage.getItem("token");
 
-const connectDB = async () => {
-    try {
-        await client.connect();
-
-        db = client.db(process.env.DB_NAME);
-
-        console.log("✅ MongoDB Connected");
-        console.log(`📂 Database: ${process.env.DB_NAME}`);
-    } catch (error) {
-        console.error("❌ MongoDB Connection Failed");
-        console.error(error.message);
-        process.exit(1);
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
     }
-};
 
-const getDB = () => db;
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
 
-module.exports = {
-    connectDB,
-    getDB,
-};
+API.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      localStorage.removeItem("token");
+      localStorage.removeItem("user");
+
+      if (window.location.pathname !== "/login") {
+        window.location.href = "/login";
+      }
+    }
+
+    return Promise.reject(error);
+  }
+);
+
+export default API;
