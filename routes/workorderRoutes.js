@@ -632,7 +632,9 @@ function parseSpreadsheetBuffer(buffer, originalName) {
 
 // GET /api/workorder-assignment/bulk/template
 router.get(`${API_BASE}/workorder-assignment/bulk/template`, (req, res) => {
- const headers = ['firstName', 'lastName', 'email', 'phone', 'gender', 'dob', 'aadhaarNumber', 'client', 'branch', 'packageName', 'priority', 'clientRef', 'checkTypes'];
+ // const headers = ['firstName', 'lastName', 'email', 'phone', 'gender', 'dob', 'aadhaarNumber', 'client', 'branch', 'packageName', 'priority', 'clientRef', 'checkTypes'];
+ const headers = [ 'email', 'phone', 'gender', 'dob', 'aadhaarNumber', 'client', 'branch', 'packageName', 'priority', 'clientRef', 'checkTypes'];
+
  const csvLine = headers.join(',');
  const sampleRow = ['John', 'Doe', 'john.doe@example.com', '9876543210', 'Male', '1990-01-15', '123456789012', 'ClientA', 'Mumbai', 'IT Package', 'Standard', 'REF-001', 'Address,Employment,Education,Criminal,Court'].join(',');
  res.setHeader('Content-Type', 'text/csv');
