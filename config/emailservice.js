@@ -20,7 +20,7 @@ const transporter = nodemailer.createTransport({
     pass: process.env.BREVO_SMTP_KEY,
   },
 });
-const FRONTEND_URL = process.env.FRONTEND_URL || "https://vt-web-portal.vercel.app";
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://portal-peach-nine.vercel.app";
 
 const WRAPPER = (title, bodyHtml) => `
 <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;">
