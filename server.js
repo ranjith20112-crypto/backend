@@ -1,4 +1,4 @@
-// server.js
+
 require("dotenv").config();
 
 const express = require("express");
@@ -54,8 +54,33 @@ app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(morgan("dev"));
 
 // ===============================
+// MongoDB Connection
+// ===============================
+
+// Start connecting immediately.
+// All requests will wait for this promise.
+const dbReady = connectDB();
+
+// ===============================
 // MongoDB Middleware
 // ===============================
+
+// Wait for MongoDB before accessing the database.
+app.use(async (req, res, next) => {
+    try {
+        await dbReady;
+        next();
+    } catch (error) {
+        console.error("❌ Database connection error:", error.message);
+
+        res.status(503).json({
+            success: false,
+            message: "Database is temporarily unavailable",
+        });
+    }
+});
+
+// Existing database middleware
 app.use(dbMiddleware);
 
 // ===============================
@@ -129,28 +154,38 @@ app.use((err, req, res, next) => {
 });
 
 // ===============================
-// Vercel / Serverless
+// Export Express App
 // ===============================
 
-// Connect database when function starts
-connectDB().catch((error) => {
-    console.error("❌ MongoDB connection error:", error);
-});
-
-// IMPORTANT:
-// Do NOT use app.listen() on Vercel.
-
-// Export Express app
+// Vercel / serverless can import this app.
+// Requests wait for the database connection above.
 module.exports = app;
 
+// ===============================
+// Render / Local Development
+// ===============================
 
-// ===============================
-// Local Development Only
-// ===============================
 if (require.main === module) {
     const PORT = process.env.PORT || 5000;
 
-    app.listen(PORT, () => {
-        console.log(`🚀 Server running on port ${PORT}`);
-    });
+    const startServer = async () => {
+        try {
+            // Wait until MongoDB is connected.
+            await dbReady;
+
+            // Start server only after DB connection.
+            app.listen(PORT, () => {
+                console.log(`🚀 Server running on port ${PORT}`);
+            });
+        } catch (error) {
+            console.error(
+                "❌ Failed to start server:",
+                error.message
+            );
+
+            process.exit(1);
+        }
+    };
+
+    startServer();
 }
