@@ -119,12 +119,12 @@ const shapeWorkorder = (doc) => {
 
 // Canonical field → list of header variants (case/space/separator insensitive).
 const FIELD_ALIASES = {
-  firstName:        ['first name', 'firstname', 'first_name', 'fname', 'first', 'given name', 'givenname', 'candidate first name', 'candidate firstname', 'candidatename', 'candidate name', 'name'],
-  lastName:         ['last name', 'lastname', 'last_name', 'lname', 'last', 'surname', 'family name', 'familyname', 'candidate last name', 'candidate lastname'],
-  email:            ['email', 'email address', 'email_id', 'email id', 'emailid', 'mail', 'e-mail', 'work email', 'work_email', 'email id', 'candidate email', 'email id'],
-  phone:            ['phone', 'phone number', 'mobile', 'mobile number', 'mobile_no', 'mobile no', 'phoneno', 'phone no', 'phone_number', 'contact', 'contact number', 'contact no', 'contactnumber', 'mobileno', 'mobile_number', 'candidate phone', 'candidate mobile', 'cell', 'cell number'],
-  client:           ['client', 'client name', 'client code', 'client id', 'company', 'company name', 'client_name', 'clientname', 'clientcode', 'client_id', 'clientid', 'companyname'],
-  packageName:      ['package name', 'package', 'package_name', 'packagename', 'packagecode', 'package_code', 'plan', 'package code', 'verification package', 'pkg'],
+  firstName:        ['first name', 'firstname', 'first_name', 'fname', 'first', 'given name', 'givenname', 'candidate first name', 'candidate firstname', 'candidatename', 'candidate name', 'name', 'candidate', 'employee name', 'employeename', 'person name', 'personname', 'full name (first)', 'applicant first name', 'applicant firstname'],
+  lastName:         ['last name', 'lastname', 'last_name', 'lname', 'last', 'surname', 'family name', 'familyname', 'candidate last name', 'candidate lastname', 'candidate surname', 'applicant last name', 'applicant lastname', 'applicant surname', 'employee last name', 'employeelastname', 'last surname', 'second name', 'secondname', 'father surname'],
+  email:            ['email', 'email address', 'email_id', 'email id', 'emailid', 'mail', 'e-mail', 'work email', 'work_email', 'email id', 'candidate email', 'email id', 'personal email', 'personalemail', 'applicant email', 'employee email', 'emailid', 'email-id'],
+  phone:            ['phone', 'phone number', 'mobile', 'mobile number', 'mobile_no', 'mobile no', 'phoneno', 'phone no', 'phone_number', 'contact', 'contact number', 'contact no', 'contactnumber', 'mobileno', 'mobile_number', 'candidate phone', 'candidate mobile', 'cell', 'cell number', 'applicant mobile', 'applicant phone', 'employee mobile', 'employee phone', 'contact no.', 'phone no.', 'mobile no.', 'handphone', 'telephone', 'tel', 'tel no'],
+  client:           ['client', 'client name', 'client code', 'client id', 'company', 'company name', 'client_name', 'clientname', 'clientcode', 'client_id', 'clientid', 'companyname', 'customer', 'customer name', 'customername', 'customer_name', 'client company', 'clientcompany', 'client_company', 'client company name', 'organization', 'organization name', 'organisation', 'organisation name', 'org', 'org name', 'tenant', 'tenant name', 'account', 'account name', 'employer', 'employer name', 'clientname', 'client code', 'client id', 'client ref name', 'business name', 'businessname'],
+  packageName:      ['package name', 'package', 'package_name', 'packagename', 'packagecode', 'package_code', 'plan', 'package code', 'verification package', 'pkg', 'plan name', 'planname', 'plan_name', 'subscription', 'subscription name', 'subscriptionname', 'verification plan', 'verification package name', 'bgv package', 'bgvpackage', 'bgv package name', 'service package', 'servicepackage', 'screening package', 'screeningpackage', 'check package', 'checkpackage', 'package name (verification)', 'pkg name', 'pkgname', 'package plan', 'packageplan'],
   gender:           ['gender', 'sex'],
   dob:              ['dob', 'date of birth', 'date_of_birth', 'birthdate', 'birth date', 'birth'],
   aadhaarNumber:    ['aadhaar number', 'aadhaar', 'aadhar', 'aadhaar no', 'aadhaar_no', 'aadhaarnumber', 'aadhar number', 'aadhar no', 'aadhaar_number', 'aadhaar_no', 'uid', 'aadhaar_no'],
@@ -880,10 +880,21 @@ router.get(`${API_BASE}/workorder-assignment/bulk/template/unified`, (req, res) 
   res.send(csvLine + '\n' + sampleRow + '\n');
 });
 
-// POST /api/workorder-assignment/bulk
+// POST /api/workorder-assignment/bulk          (creates workorders)
+// POST /api/workorder-assignment/bulk?dryRun=true  (validates ONLY — no DB writes)
+//
+// dryRun mode is for validating a file before committing. It runs every
+// check (required fields, email format, duplicate emails, client/package
+// resolution) but skips the actual insertOne. Useful when the user is
+// debugging a "Missing: ..." error — they can dry-run the file and see
+// exactly which rows would fail and why, without polluting the DB.
+//
+// POST /api/workorder-assignment/bulk/validate  is an alias for dryRun mode.
 router.post(`${API_BASE}/workorder-assignment/bulk`, bulkUpload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded.' });
+
+    const dryRun = String(req.query.dryRun || '').toLowerCase() === 'true' || req.path.endsWith('/validate');
 
     const { rows, detectedHeaders, detectedFormat } = parseSpreadsheetBuffer(req.file.buffer, req.file.originalname);
     if (!rows || rows.length === 0) {
@@ -972,7 +983,19 @@ router.post(`${API_BASE}/workorder-assignment/bulk`, bulkUpload.single('file'), 
         return v === undefined || v === null || !String(v).trim();
       });
       if (missing.length > 0) {
-        errors.push({ row: rowNum, message: `Missing: ${missing.join(', ')}`, receivedFields: Object.keys(row) });
+        // Distinguish "column not found" from "cell empty" so the user knows
+        // whether to rename a header or fill in a value.
+        const detail = missing.map((col) => {
+          const hasCol = Object.prototype.hasOwnProperty.call(row, col);
+          return hasCol ? `${col} (empty cell)` : `${col} (no matching column header)`;
+        }).join('; ');
+        errors.push({
+          row: rowNum,
+          message: `Missing: ${missing.join(', ')} — ${detail}. Detected headers: [${detectedHeaders.join(' | ')}]`,
+          receivedFields: Object.keys(row),
+          detectedHeaders,
+          missing,
+        });
         continue;
       }
 
@@ -1065,6 +1088,14 @@ router.post(`${API_BASE}/workorder-assignment/bulk`, bulkUpload.single('file'), 
         bgvRef, createdBy, origin: 'employee', createdAt: now, updatedAt: now,
       };
 
+      if (dryRun) {
+        // Validation-only mode: don't touch the DB. Just record what we WOULD
+        // have created, so the user can confirm the file is good before
+        // committing for real.
+        created.push({ _id: '(dry-run, not saved)', bgvRef, email });
+        continue;
+      }
+
       try {
         const result = await req.db.collection(WORKORDER_COLLECTION).insertOne(doc);
         if (result.insertedId) created.push({ _id: result.insertedId.toString(), bgvRef, email });
@@ -1075,15 +1106,35 @@ router.post(`${API_BASE}/workorder-assignment/bulk`, bulkUpload.single('file'), 
       }
     }
 
+    // Build a header-mapping report: for every header in the file, show
+    // which canonical key (if any) it maps to. This is GOLD for debugging
+    // "Missing: ..." errors — the user can see at a glance which columns
+    // were recognized and which were silently dropped.
+    const headerMappingReport = detectedHeaders.map((h) => {
+      const canonical = ALIAS_LOOKUP[normalizeKey(h)];
+      return { header: h, mapsTo: canonical || null, isRequired: canonical && requiredCols.includes(canonical) };
+    });
+    const unmappedHeaders = headerMappingReport.filter((h) => !h.mapsTo).map((h) => h.header);
+    const missingRequiredColumns = requiredCols.filter((col) => !headerMappingReport.some((h) => h.mapsTo === col));
+
     return res.status(200).json({
       success: true,
-      message: `Processed ${rows.length} rows: ${created.length} created, ${errors.length} failed`,
+      message: dryRun
+        ? `Dry run: validated ${rows.length} rows. Would create ${created.length}, would fail ${errors.length}.`
+        : `Processed ${rows.length} rows: ${created.length} created, ${errors.length} failed`,
+      dryRun,
       created: created.length, failed: errors.length, errors,
       // Diagnostic: expose the headers we actually read from the file. If a
       // required field still shows up as missing, the user can compare this list
       // against the alias map and either rename their column or ask us to add
       // a new alias.
       detectedHeaders,
+      // NEW: full header→canonical-key mapping report. Frontend can render
+      // this as a table so the user sees exactly which columns matched and
+      // which didn't.
+      headerMapping: headerMappingReport,
+      unmappedHeaders,
+      missingRequiredColumns,
       // What file we actually received + how we parsed it. Useful for the
       // frontend to show "Uploaded bulk_workorder_template.xlsx (CSV format, 245 bytes)".
       uploadedFile: {
@@ -1099,6 +1150,17 @@ router.post(`${API_BASE}/workorder-assignment/bulk`, bulkUpload.single('file'), 
     console.error('Bulk upload error:', err);
     return res.status(500).json({ success: false, message: err.message || 'Internal server error during bulk upload.' });
   }
+});
+
+// POST /api/workorder-assignment/bulk/validate  — alias for ?dryRun=true.
+// Validates the file end-to-end (required fields, email format, client/package
+// resolution) but does NOT write to the DB. Returns the same per-row errors
+// plus a full headerMapping report.
+router.post(`${API_BASE}/workorder-assignment/bulk/validate`, (req, res, next) => {
+  // Forward to the main /bulk handler with dryRun semantics. The handler
+  // detects this path suffix and skips the insertOne.
+  req.url = `${API_BASE}/workorder-assignment/bulk`;
+  next();
 });
 
 module.exports = router;
