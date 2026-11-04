@@ -633,15 +633,47 @@ function parseSpreadsheetBuffer(buffer, originalName) {
 // GET /api/workorder-assignment/bulk/template
 router.get(`${API_BASE}/workorder-assignment/bulk/template`, (req, res) => {
  // const headers = ['firstName', 'lastName', 'email', 'phone', 'gender', 'dob', 'aadhaarNumber', 'client', 'branch', 'packageName', 'priority', 'clientRef', 'checkTypes'];
- const headers = [ 'email', 'phone', 'gender', 'dob', 'aadhaarNumber', 'client', 'branch', 'packageName', 'priority', 'clientRef', 'checkTypes'];
+ 
+const headers = [
+  'candidateName', 'fatherName', 'emailId', 'gender', 'dob', 'phoneNumber',
+  'placeOfJoin', 'isAddressPresentRequired', 'isAddressPermanentRequired',
+  'isEducationPgRequired', 'isEducationUgRequired', 'isEducationDiplomaRequired',
+  'isEducation12thRequired', 'isEducation10thRequired', 'isEmploymentLatestRequired',
+  'totalEmploymentToBeVerify', 'isCriminalPresentRequired', 'isCriminalPermanentRequired',
+  'isCourtPresentRequired', 'isCourtPermanentRequired', 'numberOfReferences',
+  'isDrugPanel10Required', 'isDrugPanel5Required', 'isDrugPanel4Required',
+  'isDrugPanel3Required', 'isDrugPanel2Required', 'isIdPanCardRequired',
+  'isIdDrivingLicenseRequired', 'isIdVoterIdRequired', 'isIdAadharIdRequired',
+  'isIdPassportIdRequired',
+];
 
- const csvLine = headers.join(',');
- const sampleRow = ['John', 'Doe', 'john.doe@example.com', '9876543210', 'Male', '1990-01-15', '123456789012', 'ClientA', 'Mumbai', 'IT Package', 'Standard', 'REF-001', 'Address,Employment,Education,Criminal,Court'].join(',');
- res.setHeader('Content-Type', 'text/csv');
- res.setHeader('Content-Disposition', 'attachment; filename=bulk_workorder_template.csv');
- res.send(csvLine + '\n' + sampleRow + '\n');
-});
+const sampleRow1 = [
+  'John Doe', 'James Doe', 'john.doe@example.com', 'Male', '10-12-1990',
+  '9876543210', '10-10-2024', 'Yes', 'Yes', 'No', 'No', 'No', 'No', 'No',
+  'No', 0, 'No', 'No', 'No', 'No', 0, 'No', 'No', 'No', 'No', 'No', 'No',
+  'No', 'No', 'No', 'No',
+];
 
+// Second row with different checks selected
+const sampleRow2 = [
+  'Jane Roe', 'Richard Roe', 'jane.roe@example.com', 'Female', '15-06-1992',
+  '9123456780', '15-11-2024', 'No', 'No', 'Yes', 'Yes', 'No', 'Yes', 'Yes',
+  'Yes', 2, 'Yes', 'Yes', 'Yes', 'Yes', 3, 'No', 'No', 'No', 'No', 'No',
+  'Yes', 'Yes', 'No', 'Yes', 'No',
+];
+
+const wb = XLSX.utils.book_new();
+const ws = XLSX.utils.aoa_to_sheet([headers, sampleRow1, sampleRow2]);
+ws['!cols'] = headers.map(h => ({ wch: Math.min(Math.max(h.length + 2, 12), 30) }));
+XLSX.utils.book_append_sheet(wb, ws, 'Bulk Upload');
+const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+const outPath = '/home/z/my-project/scripts/test_user_actual_template.xlsx';
+fs.writeFileSync(outPath, buf);
+console.log(`Wrote test file with ${headers.length} columns and 2 sample rows:`);
+console.log(`  ${outPath}`);
+console.log('\nRow 1 candidate wants: Address (Present+Permanent)');
+console.log('Row 2 candidate wants: Education (PG+UG+12th+10th), Employment
 // POST /api/workorder-assignment/bulk
 router.post(`${API_BASE}/workorder-assignment/bulk`, bulkUpload.single('file'), async (req, res) => {
  try {
