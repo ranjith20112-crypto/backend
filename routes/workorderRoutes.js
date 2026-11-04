@@ -622,203 +622,142 @@ router.put(`${API_BASE}/workorders/:id/checks/:slNo/stop`, async (req, res) => {
  ## BULK UPLOAD ##
  #################################################################### */
 
-// -----------------------------------------------------------------
-// Normalize any header text to a canonical field name (handles "First Name", "EMAIL", "Mobile No", etc.)
-// -----------------------------------------------------------------
-const normHeader = (h) => String(h || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-
-const HEADER_MAP = {
-  firstname: 'firstName', lastname: 'lastName', fathername: 'fatherName', mothername: 'motherName',
-  email: 'email', emailid: 'email', mail: 'email',
-  phone: 'phone', mobile: 'phone', phonenumber: 'phone', mobilenumber: 'phone',
-  client: 'client', clientname: 'client', companyname: 'client',
-  packagename: 'packageName', package: 'packageName',
-  priority: 'priority', clientref: 'clientRef', branch: 'branch', checktypes: 'checkTypes',
-  gender: 'gender', dob: 'dob', dateofbirth: 'dob',
-  aadhaarnumber: 'aadhaarNumber', aadhar: 'aadhaarNumber', aadhaar: 'aadhaarNumber',
-  pannumber: 'panNumber', nameonpan: 'nameOnPan', drivinglicenseno: 'drivingLicenseNo',
-  voterid: 'voterId', passportnumber: 'passportNumber', uannumber: 'uanNumber',
-  currentaddress: 'currentAddress', currentcity: 'currentCity', currentstate: 'currentState',
-  pincode: 'pinCode', country: 'country',
-  permanentaddress: 'permanentAddress', permanentcity: 'permanentCity',
-  permanentstate: 'permanentState', permanentpincode: 'permanentPinCode',
-  maritalstatus: 'maritalStatus', nationality: 'nationality', altmobile: 'altMobile',
-  bloodgroup: 'bloodGroup', isfresher: 'isFresher', isexserviceman: 'isExServiceman',
-  physicallychallenged: 'physicallyChallenged', disabilitydetails: 'disabilityDetails',
-  chroniccondition: 'chronicCondition', chronicconditiondetails: 'chronicConditionDetails',
-};
-
-const normalizeRow = (row) => {
-  const out = {};
-  for (const [key, value] of Object.entries(row || {})) {
-    const mapped = HEADER_MAP[normHeader(key)];
-    out[mapped || key] = value;
-  }
-  return out;
-};
-
-// XLSX.read handles .xlsx, .xls and .csv buffers automatically
-function parseSpreadsheetBuffer(buffer) {
-  const workbook = XLSX.read(buffer, { type: 'buffer' });
-  const sheetName = workbook.SheetNames[0];
-  if (!sheetName) return [];
-  return XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: '' });
+// Helper: parse CSV or XLSX buffer into array of row-objects using XLSX (already imported)
+function parseSpreadsheetBuffer(buffer, originalName) {
+ const workbook = XLSX.read(buffer, { type: 'buffer' });
+ const sheetName = workbook.SheetNames[0];
+ if (!sheetName) return [];
+ return XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: '' });
 }
 
-// GET /api/workorder-assignment/bulk/template — real .xlsx template
+// GET /api/workorder-assignment/bulk/template
 router.get(`${API_BASE}/workorder-assignment/bulk/template`, (req, res) => {
-  const headers = [
-    'firstName', 'lastName', 'fatherName', 'motherName', 'email', 'phone', 'gender', 'dob',
-    'aadhaarNumber', 'client', 'branch', 'packageName', 'priority', 'clientRef', 'checkTypes',
-    'maritalStatus', 'nationality', 'altMobile', 'bloodGroup',
-    'panNumber', 'nameOnPan', 'drivingLicenseNo', 'voterId', 'passportNumber', 'uanNumber',
-    'currentAddress', 'currentCity', 'currentState', 'pinCode', 'country',
-    'permanentAddress', 'permanentCity', 'permanentState', 'permanentPinCode',
-  ];
-  const sample = [
-    'John', 'Doe', 'Richard Doe', 'Mary Doe', 'john.doe@example.com', '9876543210', 'Male', '1990-01-15',
-    '123456789012', 'ClientA', 'Mumbai', 'IT Package', 'Standard', 'REF-001', 'Address,Employment,Education',
-    'Single', 'Indian', '', 'O+', '', '', '', '', '', '',
-    '12 MG Road', 'Mumbai', 'Maharashtra', '400001', 'India',
-    '12 MG Road', 'Mumbai', 'Maharashtra', '400001',
-  ];
-  const ws = XLSX.utils.aoa_to_sheet([headers, sample]);
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, 'Workorders');
-  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', 'attachment; filename=bulk_workorder_template.xlsx');
-  res.send(buf);
+ // const headers = ['firstName', 'lastName', 'email', 'phone', 'gender', 'dob', 'aadhaarNumber', 'client', 'branch', 'packageName', 'priority', 'clientRef', 'checkTypes'];
+ const headers = [ 'email', 'phone', 'gender', 'dob', 'aadhaarNumber', 'client', 'branch', 'packageName', 'priority', 'clientRef', 'checkTypes'];
+
+ const csvLine = headers.join(',');
+ const sampleRow = ['John', 'Doe', 'john.doe@example.com', '9876543210', 'Male', '1990-01-15', '123456789012', 'ClientA', 'Mumbai', 'IT Package', 'Standard', 'REF-001', 'Address,Employment,Education,Criminal,Court'].join(',');
+ res.setHeader('Content-Type', 'text/csv');
+ res.setHeader('Content-Disposition', 'attachment; filename=bulk_workorder_template.csv');
+ res.send(csvLine + '\n' + sampleRow + '\n');
 });
 
-// POST /api/workorder-assignment/bulk — accepts .csv, .xlsx, .xls
+// POST /api/workorder-assignment/bulk
 router.post(`${API_BASE}/workorder-assignment/bulk`, bulkUpload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded.' });
+ try {
+ if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded.' });
 
-    const rawRows = parseSpreadsheetBuffer(req.file.buffer);
-    const rows = rawRows
-      .map(normalizeRow)
-      .filter((r) => Object.values(r).some((v) => String(v).trim() !== ''));
+ const rows = parseSpreadsheetBuffer(req.file.buffer, req.file.originalname);
+ if (!rows || rows.length === 0) return res.status(400).json({ success: false, message: 'File is empty or has no data rows.' });
+ if (rows.length > 500) return res.status(400).json({ success: false, message: 'Maximum 500 rows per upload.' });
 
-    if (!rows.length) return res.status(400).json({ success: false, message: 'File is empty or has no data rows.' });
-    if (rows.length > 500) return res.status(400).json({ success: false, message: 'Maximum 500 rows per upload.' });
+ const requiredCols = ['firstName', 'lastName', 'email', 'phone', 'client', 'packageName'];
+ const errors = [];
+ const created = [];
+ const seenEmails = new Set();
 
-    const requiredCols = ['firstName', 'lastName', 'email', 'phone', 'client', 'packageName'];
-    const errors = [];
-    const created = [];
-    const seenEmails = new Set();
+ // Load check-type name→id map
+ let checkTypeMap = {};
+ try {
+ const checkTypes = await req.db.collection(CHECKTYPE_COLLECTION).find({}).toArray();
+ checkTypes.forEach((ct) => {
+ const id = ct._id ? ct._id.toString() : '';
+ if (!id) return;
+ const name = (ct.name || '').toLowerCase().trim();
+ const nameCompact = name.replace(/\s+/g, '');
+ const code = (ct.code || '').toLowerCase().trim();
+ if (name) { checkTypeMap[name] = id; checkTypeMap[nameCompact] = id; }
+ if (code) checkTypeMap[code] = id;
+ });
+ } catch (e) { console.warn('Bulk upload: could not load check types:', e.message); }
 
-    // Load check-type name→id map
-    let checkTypeMap = {};
-    try {
-      const checkTypes = await req.db.collection(CHECKTYPE_COLLECTION).find({}).toArray();
-      checkTypes.forEach((ct) => {
-        const id = ct._id ? ct._id.toString() : '';
-        if (!id) return;
-        const name = (ct.name || '').toLowerCase().trim();
-        const nameCompact = name.replace(/\s+/g, '');
-        const code = (ct.code || '').toLowerCase().trim();
-        if (name) { checkTypeMap[name] = id; checkTypeMap[nameCompact] = id; }
-        if (code) checkTypeMap[code] = id;
-      });
-    } catch (e) { console.warn('Bulk upload: could not load check types:', e.message); }
+ for (let i = 0; i < rows.length; i++) {
+ const row = rows[i];
+ const rowNum = i + 2;
 
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i];
-      const rowNum = i + 2;
+ const missing = requiredCols.filter((col) => !row[col] || !String(row[col]).trim());
+ if (missing.length > 0) { errors.push({ row: rowNum, message: `Missing: ${missing.join(', ')}` }); continue; }
 
-      const missing = requiredCols.filter((col) => !row[col] || !String(row[col]).trim());
-      if (missing.length > 0) {
-        errors.push({ row: rowNum, message: `Missing: ${missing.join(', ')} (received headers: ${Object.keys(row).join(', ') || 'none'})` });
-        continue;
-      }
+ const email = String(row.email).trim();
+ if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { errors.push({ row: rowNum, message: `Invalid email: ${email}` }); continue; }
 
-      const email = String(row.email).trim();
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { errors.push({ row: rowNum, message: `Invalid email: ${email}` }); continue; }
+ const emailLower = email.toLowerCase();
+ if (seenEmails.has(emailLower)) { errors.push({ row: rowNum, message: `Duplicate email in this file: ${email}` }); continue; }
+ seenEmails.add(emailLower);
 
-      const emailLower = email.toLowerCase();
-      if (seenEmails.has(emailLower)) { errors.push({ row: rowNum, message: `Duplicate email in this file: ${email}` }); continue; }
-      seenEmails.add(emailLower);
+ const candidateDetails = {
+ personal: {
+ firstName: String(row.firstName).trim(), lastName: String(row.lastName).trim(), fatherName: String(row.fatherName || '').trim(),
+ motherName: String(row.motherName || '').trim(), email, gender: String(row.gender || '').trim(), dob: String(row.dob || '').trim(),
+ maritalStatus: String(row.maritalStatus || '').trim(), nationality: String(row.nationality || 'Indian').trim(),
+ aadhaarNumber: String(row.aadhaarNumber || '').trim(), mobile: String(row.phone || '').trim(), altMobile: String(row.altMobile || '').trim(),
+ bloodGroup: String(row.bloodGroup || '').trim(), isFresher: String(row.isFresher || '').trim(), isExServiceman: String(row.isExServiceman || '').trim(),
+ physicallyChallenged: String(row.physicallyChallenged || '').toLowerCase() === 'yes', disabilityDetails: String(row.disabilityDetails || '').trim(),
+ chronicCondition: String(row.chronicCondition || '').toLowerCase() === 'yes', chronicConditionDetails: String(row.chronicConditionDetails || '').trim(),
+ },
+ secondaryContacts: [],
+ additional: {
+ panNumber: String(row.panNumber || '').trim(), nameOnPan: String(row.nameOnPan || '').trim(),
+ drivingLicenseNo: String(row.drivingLicenseNo || '').trim(), voterId: String(row.voterId || '').trim(),
+ passportNumber: String(row.passportNumber || '').trim(), uanNumber: String(row.uanNumber || '').trim(),
+ },
+ address: {
+ currentAddress: String(row.currentAddress || '').trim(), currentCity: String(row.currentCity || '').trim(),
+ currentState: String(row.currentState || '').trim(), pinCode: String(row.pinCode || '').trim(),
+ country: String(row.country || 'India').trim(), sameAsCurrent: false,
+ permanentAddress: String(row.permanentAddress || '').trim(), permanentCity: String(row.permanentCity || '').trim(),
+ permanentState: String(row.permanentState || '').trim(), permanentPinCode: String(row.permanentPinCode || '').trim(),
+ },
+ education: [], employment: [], documents: {},
+ };
 
-      const candidateDetails = {
-        personal: {
-          firstName: String(row.firstName).trim(), lastName: String(row.lastName).trim(),
-          fatherName: String(row.fatherName || '').trim(), motherName: String(row.motherName || '').trim(),
-          email, gender: String(row.gender || '').trim(), dob: String(row.dob || '').trim(),
-          maritalStatus: String(row.maritalStatus || '').trim(), nationality: String(row.nationality || 'Indian').trim(),
-          aadhaarNumber: String(row.aadhaarNumber || '').trim(), mobile: String(row.phone || '').trim(),
-          altMobile: String(row.altMobile || '').trim(), bloodGroup: String(row.bloodGroup || '').trim(),
-          isFresher: String(row.isFresher || '').trim(), isExServiceman: String(row.isExServiceman || '').trim(),
-          physicallyChallenged: String(row.physicallyChallenged || '').toLowerCase() === 'yes',
-          disabilityDetails: String(row.disabilityDetails || '').trim(),
-          chronicCondition: String(row.chronicCondition || '').toLowerCase() === 'yes',
-          chronicConditionDetails: String(row.chronicConditionDetails || '').trim(),
-        },
-        secondaryContacts: [],
-        additional: {
-          panNumber: String(row.panNumber || '').trim(), nameOnPan: String(row.nameOnPan || '').trim(),
-          drivingLicenseNo: String(row.drivingLicenseNo || '').trim(), voterId: String(row.voterId || '').trim(),
-          passportNumber: String(row.passportNumber || '').trim(), uanNumber: String(row.uanNumber || '').trim(),
-        },
-        address: {
-          currentAddress: String(row.currentAddress || '').trim(), currentCity: String(row.currentCity || '').trim(),
-          currentState: String(row.currentState || '').trim(), pinCode: String(row.pinCode || '').trim(),
-          country: String(row.country || 'India').trim(), sameAsCurrent: false,
-          permanentAddress: String(row.permanentAddress || '').trim(), permanentCity: String(row.permanentCity || '').trim(),
-          permanentState: String(row.permanentState || '').trim(), permanentPinCode: String(row.permanentPinCode || '').trim(),
-        },
-        education: [], employment: [], documents: {},
-      };
+ // Build checks from checkTypes column
+ const checks = [];
+ const checkTypesStr = String(row.checkTypes || '').trim();
+ if (checkTypesStr) {
+ const typeNames = checkTypesStr.split(',').map((s) => s.trim()).filter(Boolean);
+ for (const typeName of typeNames) {
+ const key = typeName.toLowerCase().trim();
+ const keyCompact = key.replace(/\s+/g, '');
+ const ctId = checkTypeMap[key] || checkTypeMap[keyCompact] || null;
+ checks.push(normalizeCheck({ checkType: typeName, checkTypeId: ctId || '', status: 'assignment-pending', priority: String(row.priority || 'Standard').trim() }, checks.length));
+ }
+ }
 
-      // Build checks from checkTypes column
-      const checks = [];
-      const checkTypesStr = String(row.checkTypes || '').trim();
-      if (checkTypesStr) {
-        const typeNames = checkTypesStr.split(',').map((s) => s.trim()).filter(Boolean);
-        for (const typeName of typeNames) {
-          const key = typeName.toLowerCase().trim();
-          const keyCompact = key.replace(/\s+/g, '');
-          const ctId = checkTypeMap[key] || checkTypeMap[keyCompact] || null;
-          checks.push(normalizeCheck({ checkType: typeName, checkTypeId: ctId || '', status: 'assignment-pending', priority: String(row.priority || 'Standard').trim() }, checks.length));
-        }
-      }
+ const bgvRef = await generateBgvRef(req.db);
+ const now = new Date();
+ const createdBy = buildCreatedBy({ origin: 'employee' }, 'employee');
 
-      const bgvRef = await generateBgvRef(req.db);
-      const now = new Date();
-      const createdBy = buildCreatedBy({ origin: 'employee' }, 'employee');
+ const doc = {
+ ...buildWorkorderDoc({
+ fullName: `${String(row.firstName).trim()} ${String(row.lastName).trim()}`, email, phone: String(row.phone || '').trim(),
+ client: String(row.client || '').trim(), branch: String(row.branch || '').trim(), packageName: String(row.packageName || '').trim(),
+ priority: String(row.priority || 'Standard').trim(), clientRef: String(row.clientRef || '').trim(), initiationMode: 'Bulk Upload',
+ status: 'candidate-details', checks, candidateDetails,
+ }),
+ bgvRef, createdBy, origin: 'employee', createdAt: now, updatedAt: now,
+ };
 
-      const doc = {
-        ...buildWorkorderDoc({
-          fullName: `${String(row.firstName).trim()} ${String(row.lastName).trim()}`, email,
-          phone: String(row.phone || '').trim(), client: String(row.client || '').trim(),
-          branch: String(row.branch || '').trim(), packageName: String(row.packageName || '').trim(),
-          priority: String(row.priority || 'Standard').trim(), clientRef: String(row.clientRef || '').trim(),
-          initiationMode: 'Bulk Upload', status: 'candidate-details', checks, candidateDetails,
-        }),
-        bgvRef, createdBy, origin: 'employee', createdAt: now, updatedAt: now,
-      };
+ try {
+ const result = await req.db.collection(WORKORDER_COLLECTION).insertOne(doc);
+ if (result.insertedId) created.push({ _id: result.insertedId.toString(), bgvRef, email });
+ } catch (dbErr) {
+ let msg = dbErr.message;
+ if (dbErr.code === 11000) { const field = Object.keys(dbErr.keyValue || {})[0] || 'field'; msg = `Duplicate value for ${field}`; }
+ errors.push({ row: rowNum, message: msg });
+ }
+ }
 
-      try {
-        const result = await req.db.collection(WORKORDER_COLLECTION).insertOne(doc);
-        if (result.insertedId) created.push({ _id: result.insertedId.toString(), bgvRef, email });
-      } catch (dbErr) {
-        let msg = dbErr.message;
-        if (dbErr.code === 11000) { const field = Object.keys(dbErr.keyValue || {})[0] || 'field'; msg = `Duplicate value for ${field}`; }
-        errors.push({ row: rowNum, message: msg });
-      }
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: `Processed ${rows.length} rows: ${created.length} created, ${errors.length} failed`,
-      created: created.length, failed: errors.length, errors,
-      workorders: created.map((w) => w._id),
-    });
-  } catch (err) {
-    console.error('Bulk upload error:', err);
-    return res.status(500).json({ success: false, message: err.message || 'Internal server error during bulk upload.' });
-  }
+ return res.status(200).json({
+ success: true,
+ message: `Processed ${rows.length} rows: ${created.length} created, ${errors.length} failed`,
+ created: created.length, failed: errors.length, errors,
+ workorders: created.map((w) => w._id),
+ });
+ } catch (err) {
+ console.error('Bulk upload error:', err);
+ return res.status(500).json({ success: false, message: err.message || 'Internal server error during bulk upload.' });
+ }
 });
 
 module.exports = router;
