@@ -62,13 +62,33 @@ const documentFields = [
 // ====================================================================
 // BULK UPLOAD (memory storage for CSV / XLSX)
 // ====================================================================
+// Bulk-upload accepts CSV, XLSX, and legacy XLS files. We trust the file
+// EXTENSION over the MIME type — browsers are wildly inconsistent about the
+// MIME they attach to spreadsheets (text/csv, application/vnd.ms-excel,
+// application/octet-stream, text/plain, ...), so requiring a specific MIME
+// would reject perfectly valid uploads.
+const BULK_ALLOWED_EXT = ['.csv', '.xlsx', '.xls'];
+const BULK_ALLOWED_MIME = new Set([
+  'text/csv', 'application/csv', 'text/plain',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/octet-stream',
+  '', // some browsers send no mimetype at all
+]);
+const BULK_MAX_SIZE = 10 * 1024 * 1024; // 10 MB — CSVs with 500 rows × 30 cols can be ~3-5 MB
+
 const bulkUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 },
+  limits: { fileSize: BULK_MAX_SIZE },
   fileFilter: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (['.csv', '.xlsx', '.xls'].includes(ext)) return cb(null, true);
-    cb(new Error('Only CSV and XLSX files are allowed.'));
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    if (BULK_ALLOWED_EXT.includes(ext)) return cb(null, true);
+    // Extension didn't match. If the MIME type is one we recognise, allow it
+    // (lets us accept files where the user renamed .xlsx → .dat etc.).
+    if (file.mimetype && BULK_ALLOWED_MIME.has(file.mimetype.toLowerCase())) {
+      return cb(null, true);
+    }
+    cb(new Error(`Only CSV, XLSX, and XLS files are allowed. Received: ${ext || '(no extension)'}`));
   },
 });
 
@@ -99,12 +119,12 @@ const shapeWorkorder = (doc) => {
 
 // Canonical field → list of header variants (case/space/separator insensitive).
 const FIELD_ALIASES = {
-  firstName:        ['first name', 'firstname', 'first_name', 'fname', 'first', 'given name', 'givenname', 'candidate first name', 'candidate firstname'],
+  firstName:        ['first name', 'firstname', 'first_name', 'fname', 'first', 'given name', 'givenname', 'candidate first name', 'candidate firstname', 'candidatename', 'candidate name', 'name'],
   lastName:         ['last name', 'lastname', 'last_name', 'lname', 'last', 'surname', 'family name', 'familyname', 'candidate last name', 'candidate lastname'],
   email:            ['email', 'email address', 'email_id', 'email id', 'emailid', 'mail', 'e-mail', 'work email', 'work_email', 'email id', 'candidate email', 'email id'],
   phone:            ['phone', 'phone number', 'mobile', 'mobile number', 'mobile_no', 'mobile no', 'phoneno', 'phone no', 'phone_number', 'contact', 'contact number', 'contact no', 'contactnumber', 'mobileno', 'mobile_number', 'candidate phone', 'candidate mobile', 'cell', 'cell number'],
-  client:           ['client', 'client name', 'client code', 'company', 'company name', 'client_name', 'clientname', 'clientcode', 'companyname', 'client'],
-  packageName:      ['package name', 'package', 'package_name', 'packagename', 'plan', 'package code', 'verification package', 'package code'],
+  client:           ['client', 'client name', 'client code', 'client id', 'company', 'company name', 'client_name', 'clientname', 'clientcode', 'client_id', 'clientid', 'companyname'],
+  packageName:      ['package name', 'package', 'package_name', 'packagename', 'packagecode', 'package_code', 'plan', 'package code', 'verification package', 'pkg'],
   gender:           ['gender', 'sex'],
   dob:              ['dob', 'date of birth', 'date_of_birth', 'birthdate', 'birth date', 'birth'],
   aadhaarNumber:    ['aadhaar number', 'aadhaar', 'aadhar', 'aadhaar no', 'aadhaar_no', 'aadhaarnumber', 'aadhar number', 'aadhar no', 'aadhaar_number', 'aadhaar_no', 'uid', 'aadhaar_no'],
@@ -705,12 +725,44 @@ router.put(`${API_BASE}/workorders/:id/checks/:slNo/stop`, async (req, res) => {
  ## BULK UPLOAD  (PATCHED) ##
  #################################################################### */
 
-// Helper: parse CSV or XLSX buffer into array of row-objects using XLSX.
+// Helper: parse CSV / XLSX / XLS buffer into array of row-objects using XLSX.
 // Each row is then normalized (header variants → canonical camelCase keys).
+//
+// Two robustness tweaks over the naive `XLSX.read(buffer, { type: 'buffer' })`:
+//   1. CSV with UTF-8 BOM: Excel exports CSVs from UTF-8 workbooks with a
+//      leading 0xEF 0xBB 0xBF byte order mark. If we don't strip it, the
+//      first header key becomes "\uFEFFfirstName" and the alias map can't
+//      match it — bulk upload then fails with "Missing: firstName" even
+//      though the column is right there. Strip the BOM defensively.
+//   2. CSV encoding: pass the (BOM-stripped) buffer to SheetJS as a UTF-8
+//      STRING with type:'string' instead of letting it guess the encoding
+//      from raw bytes. For XLSX/XLS we keep type:'buffer' (binary).
 function parseSpreadsheetBuffer(buffer, originalName) {
-  const workbook = XLSX.read(buffer, { type: 'buffer' });
+  const ext = path.extname(originalName || '').toLowerCase();
+  let detectedFormat = ext.replace('.', '').toUpperCase() || 'UNKNOWN';
+
+  let workbook;
+  if (ext === '.csv') {
+    // Strip UTF-8 BOM if present.
+    let buf = buffer;
+    if (buf && buf.length >= 3 &&
+        buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF) {
+      buf = buf.slice(3);
+    }
+    // Read as string so SheetJS doesn't have to guess encoding.
+    workbook = XLSX.read(buf.toString('utf8'), { type: 'string', raw: false });
+  } else {
+    // XLSX / XLS / unknown — let SheetJS sniff the binary format.
+    workbook = XLSX.read(buffer, { type: 'buffer' });
+    // Refine detectedFormat if SheetJS tells us more.
+    if (workbook.SheetNames.length > 0) {
+      // SheetJS doesn't expose the source format directly, but XLSX is the
+      // common case for .xlsx; .xls is rare. Keep whatever the extension said.
+    }
+  }
+
   const sheetName = workbook.SheetNames[0];
-  if (!sheetName) return { rows: [], detectedHeaders: [] };
+  if (!sheetName) return { rows: [], detectedHeaders: [], detectedFormat };
 
   // Read the first row as headers (raw, original case preserved) for diagnostics.
   const sheet = workbook.Sheets[sheetName];
@@ -721,26 +773,109 @@ function parseSpreadsheetBuffer(buffer, originalName) {
   const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
   const rows = rawRows.map(normalizeRow);
 
-  return { rows, detectedHeaders };
+  return { rows, detectedHeaders, detectedFormat };
 }
 
-// GET /api/workorder-assignment/bulk/template
+// ---------------------------------------------------------------------------
+// BULK-UPLOAD TEMPLATE FIELDS
+// ---------------------------------------------------------------------------
+// Canonical column order used by BOTH the CSV and XLSX template endpoints.
+// Required columns are marked below; the rest are optional. The header names
+// here are the canonical camelCase keys the bulk-upload handler expects, but
+// the alias map above means a spreadsheet with "First Name" / "Client Name"
+// / "Package Name" / etc. will also work.
+// ---------------------------------------------------------------------------
+const BULK_TEMPLATE_HEADERS = [
+  'firstName',     // REQUIRED
+  'lastName',      // REQUIRED
+  'email',         // REQUIRED
+  'phone',         // REQUIRED
+  'gender',
+  'dob',
+  'aadhaarNumber',
+  'client',        // REQUIRED  — client name, client code, or client _id
+  'branch',
+  'packageName',   // REQUIRED  — package name or package code
+  'priority',
+  'clientRef',
+  'checkTypes',    // comma-separated, e.g. Address,Employment,Education
+];
+
+const BULK_TEMPLATE_SAMPLE = [
+  'John', 'Doe', 'john.doe@example.com', '9876543210', 'Male', '1990-01-15',
+  '123456789012', 'ClientA', 'Mumbai', 'IT Package', 'Standard', 'REF-001',
+  'Address,Employment,Education,Criminal,Court',
+];
+
+// Proper RFC-4180 CSV escaping: any cell that contains a comma, double quote,
+// or newline must be wrapped in double quotes, and any embedded double quote
+// must be doubled. Without this, a sample `checkTypes` value like
+// "Address,Employment,Education,Criminal,Court" would be split into 5 columns
+// when the template is downloaded and re-uploaded, which makes the row look
+// like it has 17 columns instead of 13 and re-triggers the
+// "Missing: firstName, lastName, ..." error.
+const csvEscapeCell = (v) => {
+  const s = String(v ?? '');
+  if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+};
+const toCsvRow = (cells) => cells.map(csvEscapeCell).join(',');
+
+// GET /api/workorder-assignment/bulk/template  (CSV)
 router.get(`${API_BASE}/workorder-assignment/bulk/template`, (req, res) => {
-  // FIXED: headers list now matches the sample row exactly (13 cols each),
-  // and firstName / lastName are restored (they are required fields).
-  const headers = [
-    'firstName', 'lastName', 'email', 'phone', 'gender', 'dob', 'aadhaarNumber',
-    'client', 'branch', 'packageName', 'priority', 'clientRef', 'checkTypes',
-  ];
+  const csvLine = toCsvRow(BULK_TEMPLATE_HEADERS);
+  const sampleRow = toCsvRow(BULK_TEMPLATE_SAMPLE);
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename=bulk_workorder_template.csv');
+  res.send(csvLine + '\n' + sampleRow + '\n');
+});
 
-  const csvLine = headers.join(',');
-  const sampleRow = [
-    'John', 'Doe', 'john.doe@example.com', '9876543210', 'Male', '1990-01-15',
-    '123456789012', 'ClientA', 'Mumbai', 'IT Package', 'Standard', 'REF-001',
-    'Address,Employment,Education,Criminal,Court',
-  ].join(',');
+// GET /api/workorder-assignment/bulk/template/xlsx  (Excel)
+// Returns a real .xlsx with two rows (header + sample), friendly column
+// widths, and a frozen header row. Much easier for end users to fill in than
+// the CSV version, and the parser already accepts .xlsx.
+router.get(`${API_BASE}/workorder-assignment/bulk/template/xlsx`, (req, res) => {
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet([BULK_TEMPLATE_HEADERS, BULK_TEMPLATE_SAMPLE]);
+  // Column widths: roughly match the longest cell in each column.
+  ws['!cols'] = BULK_TEMPLATE_HEADERS.map((h, i) => {
+    const sample = String(BULK_TEMPLATE_SAMPLE[i] || '');
+    const widest = Math.max(h.length, sample.length) + 2;
+    return { wch: Math.min(Math.max(widest, 12), 40) };
+  });
+  // Freeze the header row so it stays visible while scrolling.
+  ws['!freeze'] = { ySplit: 1 };
+  XLSX.utils.book_append_sheet(wb, ws, 'Bulk Upload');
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', 'attachment; filename=bulk_workorder_template.xlsx');
+  res.send(buf);
+});
 
-  res.setHeader('Content-Type', 'text/csv');
+// GET /api/workorder-assignment/bulk/template?format=csv|xlsx  (unified)
+// Convenience endpoint: returns CSV by default, XLSX if ?format=xlsx.
+// Useful when the frontend wants one URL and picks the format at runtime.
+router.get(`${API_BASE}/workorder-assignment/bulk/template/unified`, (req, res) => {
+  const fmt = String(req.query.format || 'csv').toLowerCase();
+  if (fmt === 'xlsx') {
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet([BULK_TEMPLATE_HEADERS, BULK_TEMPLATE_SAMPLE]);
+    ws['!cols'] = BULK_TEMPLATE_HEADERS.map((h, i) => {
+      const sample = String(BULK_TEMPLATE_SAMPLE[i] || '');
+      const widest = Math.max(h.length, sample.length) + 2;
+      return { wch: Math.min(Math.max(widest, 12), 40) };
+    });
+    ws['!freeze'] = { ySplit: 1 };
+    XLSX.utils.book_append_sheet(wb, ws, 'Bulk Upload');
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename=bulk_workorder_template.xlsx');
+    return res.send(buf);
+  }
+  // default: CSV
+  const csvLine = toCsvRow(BULK_TEMPLATE_HEADERS);
+  const sampleRow = toCsvRow(BULK_TEMPLATE_SAMPLE);
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename=bulk_workorder_template.csv');
   res.send(csvLine + '\n' + sampleRow + '\n');
 });
@@ -750,12 +885,13 @@ router.post(`${API_BASE}/workorder-assignment/bulk`, bulkUpload.single('file'), 
   try {
     if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded.' });
 
-    const { rows, detectedHeaders } = parseSpreadsheetBuffer(req.file.buffer, req.file.originalname);
+    const { rows, detectedHeaders, detectedFormat } = parseSpreadsheetBuffer(req.file.buffer, req.file.originalname);
     if (!rows || rows.length === 0) {
       return res.status(400).json({
         success: false,
         message: 'File is empty or has no data rows.',
         detectedHeaders,
+        detectedFormat,
       });
     }
     if (rows.length > 500) return res.status(400).json({ success: false, message: 'Maximum 500 rows per upload.' });
@@ -780,6 +916,51 @@ router.post(`${API_BASE}/workorder-assignment/bulk`, bulkUpload.single('file'), 
       });
     } catch (e) { console.warn('Bulk upload: could not load check types:', e.message); }
 
+    // ---- Pre-load CLIENT + PACKAGE lookup maps -------------------------
+    // The `client` column in the spreadsheet may contain a client _id, a
+    // client code, or a company/display name. We resolve each unique value
+    // to its _id once (before the row loop) so the workorder's `client`
+    // field stores the same shape the single-row create endpoint stores.
+    // `packageName` is validated against the package collection too, but we
+    // store the original string (single-row create does the same).
+    const clientLookup = new Map();   // rawInput(lower) → { _id, companyName }
+    const packageLookup = new Map();  // rawInput(lower) → { _id, name, code }
+    try {
+      const [clients, packages] = await Promise.all([
+        req.db.collection(CLIENT_COLLECTION).find({}).toArray(),
+        req.db.collection(PACKAGE_COLLECTION).find({}).toArray(),
+      ]);
+      for (const c of clients) {
+        const id = c._id ? c._id.toString() : '';
+        const name = (c.companyName || c.displayName || c.name || '').toString();
+        const code = (c.clientCode || '').toString();
+        const display = name || code;
+        if (id) {
+          if (code) clientLookup.set(code.toLowerCase().trim(), { _id: id, companyName: name });
+          if (name) clientLookup.set(name.toLowerCase().trim(), { _id: id, companyName: name });
+          clientLookup.set(id.toLowerCase(), { _id: id, companyName: name });
+        }
+      }
+      for (const p of packages) {
+        const id = p._id ? p._id.toString() : '';
+        const name = (p.name || '').toString().toLowerCase().trim();
+        const code = (p.code || '').toString().toLowerCase().trim();
+        if (name) packageLookup.set(name, { _id: id, name: p.name, code: p.code });
+        if (code) packageLookup.set(code, { _id: id, name: p.name, code: p.code });
+      }
+    } catch (e) { console.warn('Bulk upload: could not load client/package maps:', e.message); }
+
+    const resolveClient = (raw) => {
+      const key = String(raw || '').trim().toLowerCase();
+      if (!key) return null;
+      return clientLookup.get(key) || null;
+    };
+    const resolvePackage = (raw) => {
+      const key = String(raw || '').trim().toLowerCase();
+      if (!key) return null;
+      return packageLookup.get(key) || null;
+    };
+
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
       const rowNum = i + 2;
@@ -801,6 +982,31 @@ router.post(`${API_BASE}/workorder-assignment/bulk`, bulkUpload.single('file'), 
       const emailLower = email.toLowerCase();
       if (seenEmails.has(emailLower)) { errors.push({ row: rowNum, message: `Duplicate email in this file: ${email}` }); continue; }
       seenEmails.add(emailLower);
+
+      // ---- Resolve `client` and `packageName` against the DB --------------
+      // If the client can't be found by id / code / name, fail this row with
+      // a friendly message instead of silently storing a dangling reference.
+      const clientInput = String(row.client || '').trim();
+      const resolvedClient = resolveClient(clientInput);
+      if (!resolvedClient) {
+        errors.push({
+          row: rowNum,
+          message: `Client not found: "${clientInput}". Use the client Name, Code, or _id exactly as in Client Details.`,
+          field: 'client',
+        });
+        continue;
+      }
+
+      const packageInput = String(row.packageName || '').trim();
+      const resolvedPackage = resolvePackage(packageInput);
+      if (!resolvedPackage) {
+        errors.push({
+          row: rowNum,
+          message: `Package not found: "${packageInput}". Use the package Name or Code exactly as in Package Creation.`,
+          field: 'packageName',
+        });
+        continue;
+      }
 
       const candidateDetails = {
         personal: {
@@ -845,10 +1051,14 @@ router.post(`${API_BASE}/workorder-assignment/bulk`, bulkUpload.single('file'), 
       const now = new Date();
       const createdBy = buildCreatedBy({ origin: 'employee' }, 'employee');
 
+      // Store the resolved client _id (same shape as the single-row create
+      // endpoint) so the assignment-view client-name lookup works. Keep the
+      // original packageName string (single-row create does the same); we
+      // already validated it exists above.
       const doc = {
         ...buildWorkorderDoc({
           fullName: `${String(row.firstName).trim()} ${String(row.lastName).trim()}`, email, phone: String(row.phone || '').trim(),
-          client: String(row.client || '').trim(), branch: String(row.branch || '').trim(), packageName: String(row.packageName || '').trim(),
+          client: resolvedClient._id, branch: String(row.branch || '').trim(), packageName: resolvedPackage.name || packageInput,
           priority: String(row.priority || 'Standard').trim(), clientRef: String(row.clientRef || '').trim(), initiationMode: 'Bulk Upload',
           status: 'candidate-details', checks, candidateDetails,
         }),
@@ -874,6 +1084,15 @@ router.post(`${API_BASE}/workorder-assignment/bulk`, bulkUpload.single('file'), 
       // against the alias map and either rename their column or ask us to add
       // a new alias.
       detectedHeaders,
+      // What file we actually received + how we parsed it. Useful for the
+      // frontend to show "Uploaded bulk_workorder_template.xlsx (CSV format, 245 bytes)".
+      uploadedFile: {
+        name: req.file.originalname,
+        ext: path.extname(req.file.originalname || '').toLowerCase(),
+        size: req.file.size,
+        detectedFormat: detectedFormat || 'UNKNOWN',
+        rowsParsed: rows.length,
+      },
       workorders: created.map((w) => w._id),
     });
   } catch (err) {
