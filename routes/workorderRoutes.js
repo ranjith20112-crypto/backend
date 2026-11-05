@@ -632,7 +632,7 @@ function parseSpreadsheetBuffer(buffer, originalName) {
 
 // GET /api/workorder-assignment/bulk/template
 router.get(`${API_BASE}/workorder-assignment/bulk/template`, (req, res) => {
- // const headers = ['firstName', 'lastName', 'email', 'phone', 'gender', 'dob', 'aadhaarNumber', 'client', 'branch', 'packageName', 'priority', 'clientRef', 'checkTypes'];
+ // const headers = ['candidateName', 'fatherName', 'emailId', 'phoneNumber', 'gender', 'dob', 'aadhaarNumber', 'client', 'branch', 'packageName', 'priority', 'clientRef', 'checkTypes'];
  
 const headers = [
   'candidateName', 'fatherName', 'emailId', 'gender', 'dob', 'phoneNumber',
