@@ -1,171 +1,978 @@
-/* ================================================================
-   FRONTEND FIX PATCH — ClientPortal.jsx
-   ================================================================
-   The bulk-upload bug was primarily on the BACKEND (column-name
-   mismatch, ignored client context, hard-coded `origin: 'employee'`,
-   5 MB vs 10 MB limit, missing `total` / `workorderIds` in the
-   response).  Those are fixed in workorderRoutes.fixed.js.
+// routes/workorderRoutes.js  —  FIXED BULK UPLOAD
+const express = require('express');
+const router = express.Router();
+const { ObjectId } = require('mongodb');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const XLSX = require('xlsx');
+const {
+ sendCandidateInviteEmail,
+ sendNewWorkorderSupporterNotification,
+ sendCheckHoldNotification,
+ sendCaseHoldNotification,
+ sendStopCheckNotification,
+ sendStopWorkorderNotification,
+} = require('../config/emailservice');
 
-   On the FRONTEND only two small changes are needed:
+const API_BASE = '/api';
+const WORKORDER_COLLECTION = 'new-workorder-creation';
+const CHECKTYPE_COLLECTION = 'checktype-creation';
+const CLIENT_COLLECTION = 'client-details';
+const PACKAGE_COLLECTION = 'package-creation';
+const EMPLOYEE_COLLECTION = 'employee_login';
+const VENDOR_COLLECTION = 'vendors';
+const ASSIGNMENT_COLLECTION = 'Workorder-Assignment';
+const INSUFFICIENCY_COLLECTION = 'Workorder-Insufficiency';
 
-   1.  BulkUploadModal.handleUpload — compute `total` from
-       `created + failed` when the backend omits it, so the result
-       panel always shows an accurate Total count.
+// ====================================================================
+// FILE UPLOAD (multer) [SHARED — used by both employee & client]
+// ====================================================================
+const UPLOAD_DIR = path.join(__dirname, '..', 'uploads', 'candidates');
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-   2.  ClientPortal — pass an `onUploadSuccess` callback to
-       BulkUploadModal so the dashboard / track-cases list refreshes
-       the moment a bulk upload finishes.  Without this the user has
-       to manually reload the page to see newly created workorders.
+const storage = multer.diskStorage({
+ destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+ filename: (req, file, cb) => {
+ const safe = file.fieldname.replace(/[^a-z0-9_]/gi, '');
+ const ext = path.extname(file.originalname) || '';
+ cb(null, `${safe}-${Date.now()}-${Math.round(Math.random() * 1e6)}${ext}`);
+ },
+});
 
-   Apply the two edits below in your existing ClientPortal.jsx.
-   Line numbers refer to the file you pasted.
-   ================================================================ */
+const fileFilter = (req, file, cb) => {
+ const allowed = /jpeg|jpg|png|pdf/;
+ const ok = allowed.test(path.extname(file.originalname).toLowerCase()) && allowed.test(file.mimetype);
+ if (ok) return cb(null, true);
+ cb(new Error('Only JPG, PNG and PDF files are allowed.'));
+};
 
+const upload = multer({ storage, fileFilter, limits: { fileSize: 5 * 1024 * 1024 } });
+const singleDocUpload = multer({ storage, fileFilter, limits: { fileSize: 5 * 1024 * 1024 } });
 
-/* ───────────────────────────────────────────────────────────────
-   EDIT 1 — inside BulkUploadModal, replace the xhr 'load' handler
-   block (around lines 388-418) so the success branch derives
-   `total` when the server doesn't send it.
-   ─────────────────────────────────────────────────────────────── */
+const documentFields = [
+ { name: 'passportPhoto', maxCount: 1 },
+ { name: 'aadhaarFile', maxCount: 1 },
+ { name: 'panFile', maxCount: 1 },
+ { name: 'passportFile', maxCount: 1 },
+ { name: 'dlFile', maxCount: 1 },
+ { name: 'otherDocFile', maxCount: 1 },
+];
 
-// FIND THIS (lines ~388-402):
-//
-//   xhr.addEventListener('load', () => {
-//       setUploading(false);
-//       try {
-//           const data = JSON.parse(xhr.responseText);
-//           if (xhr.status >= 200 && xhr.status < 300 && data.success) {
-//           setUploadResult({
-//               success: true,
-//               message: data.message || 'Bulk upload completed successfully!',
-//               total: data.total ?? data.totalRows ?? 0,
-//               created: data.created ?? data.successCount ?? 0,
-//               failed: data.failed ?? data.failedCount ?? 0,
-//               errors: data.errors ?? data.failedRows ?? [],
-//               workorderIds: data.workorderIds ?? [],
-//           });
-//           if (onUploadSuccess) onUploadSuccess(data);
-//
-// REPLACE WITH:
+// ====================================================================
+// BULK UPLOAD (memory storage for CSV / XLSX)
+// FIX #4: increased fileSize to 10MB to match frontend limit
+// ====================================================================
+const bulkUpload = multer({
+ storage: multer.memoryStorage(),
+ limits: { fileSize: 10 * 1024 * 1024 }, // 10MB — matches frontend BulkUploadModal
+ fileFilter: (req, file, cb) => {
+ const ext = path.extname(file.originalname).toLowerCase();
+ if (['.csv', '.xlsx', '.xls'].includes(ext)) return cb(null, true);
+ cb(new Error('Only CSV and XLSX files are allowed.'));
+ },
+});
 
-        xhr.addEventListener('load', () => {
-        setUploading(false);
-        try {
-            const data = JSON.parse(xhr.responseText);
-            if (xhr.status >= 200 && xhr.status < 300 && data.success) {
-            const createdCount = data.created ?? data.successCount ?? 0;
-            const failedCount  = data.failed  ?? data.failedCount  ?? 0;
-            setUploadResult({
-                success: true,
-                message: data.message || 'Bulk upload completed successfully!',
-                // FIX: derive total when backend omits it
-                total: data.total ?? data.totalRows ?? (createdCount + failedCount) ?? 0,
-                created: createdCount,
-                failed: failedCount,
-                errors: data.errors ?? data.failedRows ?? [],
-                workorderIds: data.workorderIds ?? data.workorders ?? [],
-            });
-            if (onUploadSuccess) onUploadSuccess(data);
-            } else {
-            setUploadResult({
-                success: false,
-                message: data.message || `Server error (${xhr.status})`,
-                total: 0, created: 0, failed: 0,
-                errors: data.errors || [data.message || `Upload failed (HTTP ${xhr.status})`],
-            });
-            }
-        } catch {
-            setUploadResult({
-            success: false, message: 'Invalid response from server.',
-            total: 0, created: 0, failed: 0,
-            errors: ['Could not parse server response. Is the backend running?'],
-            });
-        }
-        });
+// ---- Helpers [SHARED] ----
+const isValidId = (id) => {
+ try { return ObjectId.isValid(id) && String(new ObjectId(id)) === String(id); } catch { return false; }
+};
 
+const toObjectIdSafe = (id) => {
+ try { return new ObjectId(id); } catch { return null; }
+};
 
-/* ───────────────────────────────────────────────────────────────
-   EDIT 2 — in the main ClientPortal component, add a refresh key
-   and pass it as onUploadSuccess so DashboardContent /
-   TrackCaseDashboard re-fetch after a bulk upload.
+const shapeWorkorder = (doc) => {
+ if (!doc) return null;
+ return { ...doc, _id: doc._id ? doc._id.toString() : undefined };
+};
 
-   The DashboardContent and TrackCaseDashboard components already
-   own their own fetchData (called via useEffect on mount).  The
-   cleanest way to force a re-fetch without restructuring those
-   components is to bump a `bulkUploadNonce` counter that we pass
-   as `key` to whichever content view is active.  A key change
-   unmounts + remounts the child, re-running its useEffect.
+// --------------------------------------------------------------------
+// SUPPORTER EMAIL RESOLUTION [SHARED]
+// --------------------------------------------------------------------
+const employeeDisplayName = (e) => {
+ const firstName = e.firstName || e.first_name || '';
+ const lastName = e.lastName || e.last_name || '';
+ const fullName = [firstName, lastName].filter(Boolean).join(' ');
+ return fullName || e.displayName || e.name || e.email || 'Unknown';
+};
 
-   Around line 1598 add the nonce state, and around line 1707
-   wire onUploadSuccess.
-   ─────────────────────────────────────────────────────────────── */
+const findSupporterEmail = async (db, supporterName) => {
+ if (!supporterName) return '';
+ try {
+ const employees = await db.collection(EMPLOYEE_COLLECTION).find({}).toArray();
+ const match = employees.find((e) => employeeDisplayName(e).toLowerCase().trim() === String(supporterName).toLowerCase().trim());
+ return match?.email || '';
+ } catch (err) { console.error('findSupporterEmail error:', err.message); return ''; }
+};
 
-// FIND THIS (line ~1598):
-//
-//   // ★ Bulk Upload Modal State ★
-//   const [showBulkUploadModal, setShowBulkUploadModal] = useState(false);
-//
-// REPLACE WITH:
+const findClientDoc = async (db, clientRef) => {
+ if (!clientRef) return null;
+ try {
+ if (isValidId(clientRef)) { const byId = await db.collection(CLIENT_COLLECTION).findOne({ _id: new ObjectId(clientRef) }); if (byId) return byId; }
+ return await db.collection(CLIENT_COLLECTION).findOne({ $or: [{ companyName: clientRef }, { clientCode: clientRef }, { displayName: clientRef }] });
+ } catch (err) { console.error('findClientDoc error:', err.message); return null; }
+};
 
-    // ★ Bulk Upload Modal State ★
-    const [showBulkUploadModal, setShowBulkUploadModal] = useState(false);
-    // ★ bumped after every successful bulk upload so the active
-    //   content view (Dashboard / Track Cases) remounts and
-    //   re-fetches its workorder list.
-    const [bulkUploadNonce, setBulkUploadNonce] = useState(0);
+const notifySupporterOfNewWorkorder = (db, { clientRef, bgvRef, candidateName, workorderId }) => {
+ (async () => {
+ try {
+ const clientDoc = await findClientDoc(db, clientRef);
+ const supporterEmail = clientDoc ? await findSupporterEmail(db, clientDoc.customerSupporter) : '';
+ await sendNewWorkorderSupporterNotification({ supporterEmail, clientName: clientDoc?.companyName || clientRef, bgvRef, candidateName, workorderId });
+ } catch (err) { console.error('notifySupporterOfNewWorkorder failed:', err.message); }
+ })();
+};
 
-    const handleBulkUploadSuccess = (data) => {
-        setBulkUploadNonce(n => n + 1);
-        const created = data?.created ?? 0;
-        const failed  = data?.failed  ?? 0;
-        showToast(
-            failed > 0
-                ? `Bulk upload done — ${created} created, ${failed} failed.`
-                : `Bulk upload done — ${created} workorder${created === 1 ? '' : 's'} created.`,
-            failed > 0 ? 'warning' : 'success'
-        );
-    };
+// --------------------------------------------------------------------
+// CREATOR TRACKING [SHARED]
+// --------------------------------------------------------------------
+const VALID_ORIGINS = ['employee', 'client'];
 
-// THEN FIND the renderContent switch (lines ~1659-1680) and add a
-// `key` prop to DashboardContent and TrackCaseDashboard so they
-// remount when bulkUploadNonce changes:
+const buildCreatedBy = (body = {}, fallbackOrigin = 'employee') => {
+ const incoming = body.createdBy && typeof body.createdBy === 'object' ? body.createdBy : {};
+ let origin = (incoming.origin || body.origin || body.creatorRole || '').toString().trim().toLowerCase();
+ const hasClientIdentity = !!(incoming.clientCode || body.clientCode || incoming.portalEmail || body.portalEmail || incoming.clientId || body.clientId);
+ if (!VALID_ORIGINS.includes(origin)) { origin = hasClientIdentity ? 'client' : fallbackOrigin; }
+ if (!VALID_ORIGINS.includes(origin)) origin = 'employee';
+ return {
+ origin, userId: (incoming.userId || body.creatorId || body.clientId || '').toString().trim(),
+ name: (incoming.name || body.creatorName || body.uploadedByName || body.companyName || '').toString().trim(),
+ email: (incoming.email || body.creatorEmail || body.uploadedBy || body.portalEmail || '').toString().trim(),
+ role: (incoming.role || '').toString().trim(),
+ clientCode: (incoming.clientCode || body.clientCode || '').toString().trim(),
+ clientId: (incoming.clientId || body.clientId || '').toString().trim(),
+ portalEmail: (incoming.portalEmail || body.portalEmail || body.uploadedBy || '').toString().trim(),
+ branchName: (incoming.branchName || body.branchName || '').toString().trim(),
+ createdAt: new Date(),
+ };
+};
 
-    const renderContent = () => {
-        switch (activeContent) {
-        case 'dashboard':
-            return <DashboardContent key={`dash-${bulkUploadNonce}`} onNavigate={handleNavigate} clientAuth={clientAuth} />;
-        case 'track-cases':
-            return <TrackCaseDashboard key={`track-${bulkUploadNonce}`} clientAuth={clientAuth} onNavigate={handleNavigate} />;
-        case 'initiate-case':
-            return <InitiateCaseForm onBack={() => handleNavigate('back-to-dashboard')} onSubmitted={handleCaseSubmitted} clientAuth={clientAuth} />;
-        case 'support-dashboard':
-            return <SupportDashboard clientAuth={clientAuth} />;
-        case 'fee-approvals':
-            return <PlaceholderView title="Fee Approvals" subtitle="Fee approval management will be available soon" icon={FiDollarSign} color="#EC4899" />;
-        case 'cards':
-            const currentMenu = sidebarMenu.find(m => m.name === activeMenu);
-            if (currentMenu?.items?.length > 0) {
-            return <CardGridView title={activeMenu} subtitle={currentMenu.items.length + ' options available'} items={currentMenu.items} menuColor={currentMenu.color} onCardClick={handleCardClick} activeCard={activeCard} />;
-            }
-            return <PlaceholderView title={activeMenu} subtitle="Content coming soon" icon={currentMenu?.icon || FiGrid} color={currentMenu?.color || '#6b7280'} />;
-        default:
-            return <DashboardContent key={`dash-${bulkUploadNonce}`} onNavigate={handleNavigate} clientAuth={clientAuth} />;
-        }
-    };
+const normalizeCheck = (c, i) => ({
+ slNo: i + 1, checkType: c.checkType || '', checkTypeId: c.checkTypeId || '', subType: c.subType || '', subCheckId: c.subCheckId || null,
+ infoNeeded: c.infoNeeded || 'Candidate', count: Number(c.count) || 1, fields: Array.isArray(c.fields) ? c.fields : [],
+ data: c.data && typeof c.data === 'object' ? c.data : {}, status: c.status || 'pending', notes: c.notes || '',
+ assignedTo: c.assignedTo || '', assignedToId: c.assignedToId || null, assignedToEmail: c.assignedToEmail || '',
+ assignmentType: c.assignmentType || null, slaDeadline: c.slaDeadline || null, assignedAt: c.assignedAt || null, completedAt: c.completedAt || null,
+ previousStatus: c.previousStatus || null, insufficiencyDescription: c.insufficiencyDescription || '',
+ insufficiencyRaisedAt: c.insufficiencyRaisedAt || null, insufficiencyClearedAt: c.insufficiencyClearedAt || null,
+ holdPreviousStatus: c.holdPreviousStatus || null, holdReason: c.holdReason || '', holdRaisedAt: c.holdRaisedAt || null,
+ holdClearedAt: c.holdClearedAt || null, holdRaisedBy: c.holdRaisedBy || null,
+ stopped: !!c.stopped, stoppedAt: c.stoppedAt || null, stopReason: c.stopReason || '', stoppedBy: c.stoppedBy || null,
+ paymentDue: c.paymentDue !== undefined ? !!c.paymentDue : false, previousStatusBeforeStop: c.previousStatusBeforeStop || null,
+});
 
-// FINALLY FIND the BulkUploadModal usage (lines ~1707-1711):
-//
-//   <BulkUploadModal
-//       isOpen={showBulkUploadModal}
-//       onClose={() => setShowBulkUploadModal(false)}
-//       clientAuth={clientAuth}
-//   />
-//
-// REPLACE WITH:
+const normalizeChecks = (checks) => Array.isArray(checks) ? checks.map(normalizeCheck) : [];
 
-        <BulkUploadModal
-            isOpen={showBulkUploadModal}
-            onClose={() => setShowBulkUploadModal(false)}
-            clientAuth={clientAuth}
-            onUploadSuccess={handleBulkUploadSuccess}
-        />
+const buildWorkorderDoc = (body) => {
+ const { fullName = '', email = '', phone = '', client = '', branch = '', packageName = '', priority = 'Standard', clientRef = '', initiationMode = 'Candidate', checks = [], candidateDetails = {}, status = 'draft', assignedTo = '', target = '' } = body || {};
+ return {
+ fullName: String(fullName).trim(), email: String(email).trim(), phone: String(phone).trim(), client: String(client).trim(),
+ branch: String(branch).trim(), packageName: String(packageName).trim(), priority: String(priority).trim() || 'Standard',
+ clientRef: String(clientRef).trim(), initiationMode: String(initiationMode).trim() || 'Candidate', checks: normalizeChecks(checks),
+ candidateDetails: candidateDetails || {}, documents: [], status: status || 'draft', assignedTo: String(assignedTo).trim(), target: target || '',
+ locked: false, lockedAt: null, lockedBy: null,
+ casePreviousStatus: null, caseHoldReason: '', caseHoldRaisedAt: null, caseHoldClearedAt: null, caseHoldRaisedBy: null,
+ stopped: false, stoppedAt: null, stopReason: '', stoppedBy: null, paymentDue: false, previousStatusBeforeWorkorderStop: null,
+ };
+};
+
+const generateBgvRef = async (db) => {
+ const year = new Date().getFullYear();
+ const prefix = `BGV-${year}-`;
+ const last = await db.collection(WORKORDER_COLLECTION).find({ bgvRef: { $regex: `^${prefix}` } }).sort({ bgvRef: -1 }).limit(1).toArray();
+ let nextSeq = 1;
+ if (last.length && last[0].bgvRef) { const seq = parseInt(last[0].bgvRef.split('-')[2], 10); if (!isNaN(seq)) nextSeq = seq + 1; }
+ return `${prefix}${String(nextSeq).padStart(5, '0')}`;
+};
+
+const computeProgress = (wo) => {
+ const checks = Array.isArray(wo.checks) ? wo.checks : [];
+ const total = Math.max(checks.length, 1);
+ let done = checks.filter((c) => (c.data && Object.keys(c.data).length > 0) || c.status === 'completed').length;
+ if (checks.length === 0) { const cd = wo.candidateDetails || {}; done = cd && Object.keys(cd).length > 0 ? 1 : 0; }
+ return { done, total };
+};
+
+const shapeCheckFromMaster = (master) => {
+ if (!master) return null;
+ const rawFields = master.fields || master.formFields || master.customFields || master.checkFields || [];
+ const fields = Array.isArray(rawFields) ? rawFields.map((f) => {
+ if (typeof f === 'string') return { name: f, label: f, type: 'text' };
+ return { name: f.name || f.key || f.fieldName || f.label, label: f.label || f.name || f.key || 'Field', type: f.type || f.fieldType || 'text', required: !!f.required, options: f.options || f.choices || [], placeholder: f.placeholder || '' };
+ }).filter((f) => f.name) : [];
+ const subType = (Array.isArray(master.subChecks) && master.subChecks[0]) || (Array.isArray(master.subCheckTypes) && master.subCheckTypes[0]) || master.subType || '';
+ return { checkTypeId: master._id ? master._id.toString() : '', checkCode: master.code || '', checkType: master.name || master.checkTypeName || master.checkType || 'Check', subType, subChecks: Array.isArray(master.subChecks) ? master.subChecks : [], infoNeeded: master.infoNeeded || master.infoSource || 'Candidate', sla: master.sla ?? null, fieldVisit: !!master.fieldVisit, digital: !!master.digital, count: 1, fields, data: {}, status: 'pending', notes: '' };
+};
+
+const syncWorkorderAssignment = async (db, workorderId, { assignedTo, assignedToId, assignmentType, status }) => {
+ const objectId = toObjectIdSafe(workorderId);
+ await db.collection(WORKORDER_COLLECTION).updateOne({ _id: objectId || workorderId }, { $set: { assignedTo: assignedTo ?? '', assignedToId: assignedToId ?? null, assignmentType: assignmentType ?? null, ...(status ? { status } : {}), updatedAt: new Date() } });
+};
+
+const PAYMENT_GRACE_WINDOW_MS = 24 * 60 * 60 * 1000;
+const isPaymentDue = (createdAt) => { if (!createdAt) return true; return Date.now() - new Date(createdAt).getTime() > PAYMENT_GRACE_WINDOW_MS; };
+const paymentGraceExpiresAt = (createdAt) => createdAt ? new Date(new Date(createdAt).getTime() + PAYMENT_GRACE_WINDOW_MS) : null;
+const paymentPolicyNote = (paymentDue) => paymentDue ? 'This action is being taken after the 24-hour payment-review window from workorder creation. As per Verifitech policy, payment is due for the verification work already initiated on this record.' : 'This action is within the 24-hour payment-review window from workorder creation. As per Verifitech policy, no payment is due for this stop.';
+
+/* ####################################################################
+ ## EMPLOYEE WORKORDER API ##
+ #################################################################### */
+
+router.get(`${API_BASE}/checktypes`, async (req, res) => {
+ try {
+ const checkTypes = await req.db.collection(CHECKTYPE_COLLECTION).find({}).sort({ sortOrder: 1, createdAt: -1 }).toArray();
+ res.json({ success: true, checkTypes: checkTypes.map((c) => ({ ...c, _id: c._id.toString() })) });
+ } catch (error) { console.error('Get Check Types Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.post(`${API_BASE}/workorders`, async (req, res) => {
+ try {
+ const doc = buildWorkorderDoc(req.body);
+ if (!doc.fullName || !doc.email || !doc.phone) return res.status(400).json({ success: false, message: 'Full name, email and phone are required.' });
+ if (!doc.client) return res.status(400).json({ success: false, message: 'Client is required.' });
+ const forcedOrigin = (req.query.as || '').toString().trim().toLowerCase();
+ const fallback = VALID_ORIGINS.includes(forcedOrigin) ? forcedOrigin : 'employee';
+ const createdBy = buildCreatedBy(forcedOrigin ? { ...req.body, origin: forcedOrigin } : req.body, fallback);
+ const bgvRef = await generateBgvRef(req.db);
+ const now = new Date();
+ const payload = { ...doc, createdBy, origin: createdBy.origin, bgvRef, createdAt: now, updatedAt: now };
+ const result = await req.db.collection(WORKORDER_COLLECTION).insertOne(payload);
+ const saved = await req.db.collection(WORKORDER_COLLECTION).findOne({ _id: result.insertedId });
+ if (createdBy.origin === 'client') { notifySupporterOfNewWorkorder(req.db, { clientRef: doc.client, bgvRef, candidateName: doc.fullName, workorderId: result.insertedId.toString() }); }
+ res.status(201).json({ success: true, message: `Workorder saved as draft (created by ${createdBy.origin}).`, workorder: shapeWorkorder(saved) });
+ } catch (error) { console.error('Create Workorder Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.get(`${API_BASE}/workorders`, async (req, res) => {
+ try {
+ const origin = (req.query.origin || '').toString().trim().toLowerCase();
+ const clientCode = (req.query.clientCode || '').toString().trim();
+ const portalEmail = (req.query.portalEmail || '').toString().trim();
+ const query = {};
+ if (VALID_ORIGINS.includes(origin)) query.origin = origin;
+ if (clientCode) query['createdBy.clientCode'] = clientCode;
+ if (portalEmail) query['createdBy.portalEmail'] = portalEmail;
+ const workorders = await req.db.collection(WORKORDER_COLLECTION).find(query).sort({ createdAt: -1 }).toArray();
+
+ let clientNameById = new Map();
+ try {
+ const rawClientIds = [...new Set(workorders.map((w) => { const c = w.client; return c && typeof c === 'string' && isValidId(c) ? c : null; }).filter(Boolean))];
+ if (rawClientIds.length > 0) {
+ const clients = await req.db.collection(CLIENT_COLLECTION).find({ _id: { $in: rawClientIds.map((id) => new ObjectId(id)) } }).toArray();
+ clientNameById = new Map(clients.map((c) => [c._id.toString(), c.companyName || c.displayName || c.name || 'Unnamed Client']));
+ }
+ } catch (lookupErr) { console.error('Client name lookup error:', lookupErr.message); }
+
+ const shaped = workorders.map((wo) => {
+ const p = computeProgress(wo);
+ const clientId = wo.client && typeof wo.client === 'string' ? wo.client : '';
+ const resolvedClientName = clientId && clientNameById.has(clientId) ? clientNameById.get(clientId) : wo.clientName || wo.client || '—';
+ return { ...shapeWorkorder(wo), progressDone: p.done, progressTotal: p.total, client: resolvedClientName, companyName: resolvedClientName };
+ });
+
+ const stats = {
+ total: shaped.length, active: shaped.filter((w) => w.status !== 'completed' && w.status !== 'cancelled' && w.status !== 'overdue').length,
+ completed: shaped.filter((w) => w.status === 'completed').length, overdue: shaped.filter((w) => w.status === 'overdue').length,
+ onHold: shaped.filter((w) => w.status === 'on-hold').length, stopped: shaped.filter((w) => w.stopped).length,
+ byEmployee: shaped.filter((w) => w.origin === 'employee').length, byClient: shaped.filter((w) => w.origin === 'client').length,
+ };
+ res.json({ success: true, workorders: shaped, stats });
+ } catch (error) { console.error('List Workorders Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.get(`${API_BASE}/workorders/assignment-view`, async (req, res) => {
+ try {
+ const rawWorkorders = await req.db.collection(WORKORDER_COLLECTION).find({}).sort({ createdAt: -1 }).toArray();
+ let clientNameById = new Map();
+ try {
+ const rawClientIds = [...new Set(rawWorkorders.map((w) => (w.client ? w.client.toString() : null)).filter(Boolean))];
+ if (rawClientIds.length > 0) {
+ const clients = await req.db.collection(CLIENT_COLLECTION).find({ _id: { $in: rawClientIds } }).toArray();
+ clientNameById = new Map(clients.map((c) => [c._id.toString(), c.companyName || c.displayName || c.name || 'Unnamed Client']));
+ }
+ } catch (lookupErr) { console.error('Client lookup error:', lookupErr.message); }
+
+ const workorders = rawWorkorders.map((w) => {
+ const checks = Array.isArray(w.checks) ? w.checks : [];
+ const totalChecks = checks.length || 1;
+ const completedChecks = checks.filter((c) => ['completed', 'done', 'verified'].includes((c.status || '').toLowerCase())).length;
+ const clientId = w.client && w.client.toString ? w.client.toString() : w.client;
+ return {
+ _id: w._id.toString(), bgvRef: w.bgvRef || null,
+ candidateName: w.fullName || w.candidateName || w.candidateDetails?.nameOnAadhaar || w.candidateDetails?.name || 'Unnamed Candidate',
+ client: clientNameById.get(clientId) || w.client || 'Unknown Client', package: w.packageName || w.package || '—',
+ status: w.status || 'draft', progress: { current: completedChecks, total: totalChecks },
+ assigned: w.assignedTo && String(w.assignedTo).trim() !== '' ? (typeof w.assignedTo === 'object' ? w.assignedTo.name || w.assignedTo.companyName || 'Assigned' : w.assignedTo) : 'Unassigned',
+ createdAt: w.createdAt || null, updatedAt: w.updatedAt || null,
+ };
+ });
+ res.json({ success: true, workorders, debug: { clientResolutionCount: clientNameById.size } });
+ } catch (error) { console.error('Get Workorders (assignment-view) Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.get(`${API_BASE}/workorders/:id`, async (req, res) => {
+ try {
+ const { id } = req.params;
+ if (!isValidId(id)) return res.status(400).json({ success: false, message: 'Invalid workorder id.' });
+ const wo = await req.db.collection(WORKORDER_COLLECTION).findOne({ _id: new ObjectId(id) });
+ if (!wo) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ res.json({ success: true, workorder: shapeWorkorder(wo) });
+ } catch (error) { console.error('Get Workorder Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.put(`${API_BASE}/workorders/:id`, async (req, res) => {
+ try {
+ const { id } = req.params;
+ if (!isValidId(id)) return res.status(400).json({ success: false, message: 'Invalid workorder id.' });
+ const existing = await req.db.collection(WORKORDER_COLLECTION).findOne({ _id: new ObjectId(id) });
+ if (!existing) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ if (existing.locked) return res.status(423).json({ success: false, message: 'This workorder is finalized and cannot be edited. Unlock it first.' });
+ const updateFields = { updatedAt: new Date() };
+ const allowed = ['fullName', 'email', 'phone', 'client', 'branch', 'packageName', 'priority', 'clientRef', 'initiationMode', 'checks', 'candidateDetails', 'status', 'assignedTo', 'target'];
+ allowed.forEach((key) => { if (req.body[key] !== undefined) { if (key === 'checks') updateFields.checks = normalizeChecks(req.body.checks); else updateFields[key] = req.body[key]; } });
+ const result = await req.db.collection(WORKORDER_COLLECTION).findOneAndUpdate({ _id: new ObjectId(id) }, { $set: updateFields }, { returnDocument: 'after' });
+ const updated = result?.value || result;
+ if (!updated) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ res.json({ success: true, message: 'Workorder updated.', workorder: shapeWorkorder(updated.value ? updated.value : updated) });
+ } catch (error) { console.error('Update Workorder Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.put(`${API_BASE}/workorders/:id/lock`, async (req, res) => {
+ try {
+ const { id } = req.params; const { locked } = req.body;
+ if (!isValidId(id)) return res.status(400).json({ success: false, message: 'Invalid workorder id.' });
+ if (typeof locked !== 'boolean') return res.status(400).json({ success: false, message: '`locked` must be true or false.' });
+ const now = new Date();
+ const result = await req.db.collection(WORKORDER_COLLECTION).findOneAndUpdate({ _id: new ObjectId(id) }, { $set: { locked, lockedAt: locked ? now : null, lockedBy: locked ? (req.user?._id || null) : null, updatedAt: now } }, { returnDocument: 'after' });
+ const updated = result?.value || result;
+ if (!updated) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ res.json({ success: true, message: locked ? 'Workorder finalized.' : 'Workorder unlocked.', locked, workorder: shapeWorkorder(updated.value ? updated.value : updated) });
+ } catch (error) { console.error('Lock Workorder Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.put(`${API_BASE}/workorders/:id/checks/:slNo`, async (req, res) => {
+ try {
+ const { id, slNo } = req.params;
+ if (!isValidId(id)) return res.status(400).json({ success: false, message: 'Invalid workorder id.' });
+ const wo = await req.db.collection(WORKORDER_COLLECTION).findOne({ _id: new ObjectId(id) });
+ if (!wo) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ const checks = Array.isArray(wo.checks) ? wo.checks : [];
+ const idx = checks.findIndex((c) => String(c.slNo) === String(slNo));
+ if (idx === -1) return res.status(404).json({ success: false, message: 'Check not found.' });
+ if (req.body.data && typeof req.body.data === 'object') checks[idx].data = { ...(checks[idx].data || {}), ...req.body.data };
+ if (req.body.status !== undefined) checks[idx].status = req.body.status;
+ if (req.body.notes !== undefined) checks[idx].notes = req.body.notes;
+ const result = await req.db.collection(WORKORDER_COLLECTION).findOneAndUpdate({ _id: new ObjectId(id) }, { $set: { checks, updatedAt: new Date() } }, { returnDocument: 'after' });
+ const updated = result?.value || result;
+ res.json({ success: true, message: 'Check updated.', workorder: shapeWorkorder(updated.value ? updated.value : updated) });
+ } catch (error) { console.error('Update Check Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.post(`${API_BASE}/workorders/:id/checks/:slNo/documents`, upload.any(), async (req, res) => {
+ try {
+ const { id, slNo } = req.params;
+ if (!isValidId(id)) return res.status(400).json({ success: false, message: 'Invalid workorder id.' });
+ const wo = await req.db.collection(WORKORDER_COLLECTION).findOne({ _id: new ObjectId(id) });
+ if (!wo) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ const checks = Array.isArray(wo.checks) ? wo.checks : [];
+ const exists = checks.some((c) => String(c.slNo) === String(slNo));
+ if (!exists) return res.status(404).json({ success: false, message: 'Check not found.' });
+ const files = req.files || [];
+ const saved = files.map((f) => ({ fieldname: f.fieldname, url: `/uploads/candidates/${f.filename}`, originalName: f.originalname }));
+ res.json({ success: true, files: saved });
+ } catch (error) { console.error('Upload Check Document Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.post(`${API_BASE}/workorders/:id/documents`, singleDocUpload.single('file'), async (req, res) => {
+ try {
+ const { id } = req.params;
+ if (!isValidId(id)) return res.status(400).json({ success: false, message: 'Invalid workorder id.' });
+ if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded.' });
+ const documentType = (req.body.documentType || 'Other').toString().trim();
+ const checkSlNo = req.body.checkSlNo ? String(req.body.checkSlNo).trim() : null;
+ const wo = await req.db.collection(WORKORDER_COLLECTION).findOne({ _id: new ObjectId(id) });
+ if (!wo) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ const docEntry = { id: new ObjectId().toString(), documentType, checkSlNo, url: `/uploads/candidates/${req.file.filename}`, originalName: req.file.originalname, uploadedAt: new Date() };
+ const documents = Array.isArray(wo.documents) ? [...wo.documents] : [];
+ documents.push(docEntry);
+ const result = await req.db.collection(WORKORDER_COLLECTION).findOneAndUpdate({ _id: new ObjectId(id) }, { $set: { documents, updatedAt: new Date() } }, { returnDocument: 'after' });
+ const updated = result?.value || result;
+ res.status(201).json({ success: true, message: 'Document uploaded successfully.', document: docEntry, workorder: shapeWorkorder(updated.value ? updated.value : updated) });
+ } catch (error) { console.error('Upload Workorder Document Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.get(`${API_BASE}/workorders/:id/documents`, async (req, res) => {
+ try {
+ const { id } = req.params;
+ if (!isValidId(id)) return res.status(400).json({ success: false, message: 'Invalid workorder id.' });
+ const wo = await req.db.collection(WORKORDER_COLLECTION).findOne({ _id: new ObjectId(id) });
+ if (!wo) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ res.json({ success: true, documents: Array.isArray(wo.documents) ? wo.documents : [] });
+ } catch (error) { console.error('List Workorder Documents Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.delete(`${API_BASE}/workorders/:id/documents/:docId`, async (req, res) => {
+ try {
+ const { id, docId } = req.params;
+ if (!isValidId(id)) return res.status(400).json({ success: false, message: 'Invalid workorder id.' });
+ const wo = await req.db.collection(WORKORDER_COLLECTION).findOne({ _id: new ObjectId(id) });
+ if (!wo) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ const existingDocs = Array.isArray(wo.documents) ? wo.documents : [];
+ const target = existingDocs.find((d) => d.id === docId);
+ const documents = existingDocs.filter((d) => d.id !== docId);
+ if (!target) return res.status(404).json({ success: false, message: 'Document not found.' });
+ if (target.url) { const filePath = path.join(__dirname, '..', target.url.replace(/^\//, '')); fs.unlink(filePath, (err) => { if (err) console.warn('Could not delete physical file:', filePath, err.message); }); }
+ const result = await req.db.collection(WORKORDER_COLLECTION).findOneAndUpdate({ _id: new ObjectId(id) }, { $set: { documents, updatedAt: new Date() } }, { returnDocument: 'after' });
+ const updated = result?.value || result;
+ res.json({ success: true, message: 'Document removed successfully.', workorder: shapeWorkorder(updated.value ? updated.value : updated) });
+ } catch (error) { console.error('Delete Workorder Document Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.put(`${API_BASE}/workorders/:id/candidate`, upload.fields(documentFields), async (req, res) => {
+ try {
+ const { id } = req.params;
+ if (!isValidId(id)) return res.status(400).json({ success: false, message: 'Invalid workorder id.' });
+ let candidateDetails = {};
+ if (req.body.candidateDetails) { try { candidateDetails = typeof req.body.candidateDetails === 'string' ? JSON.parse(req.body.candidateDetails) : req.body.candidateDetails; } catch { candidateDetails = {}; } }
+ const files = req.files || {};
+ const fileUrl = (f) => (f && f[0] ? `/uploads/candidates/${f[0].filename}` : undefined);
+ const documents = { ...(candidateDetails.documents || {}) };
+ if (fileUrl(files.passportPhoto)) documents.passportPhoto = fileUrl(files.passportPhoto);
+ if (fileUrl(files.aadhaarFile)) documents.aadhaarFile = fileUrl(files.aadhaarFile);
+ if (fileUrl(files.panFile)) documents.panFile = fileUrl(files.panFile);
+ if (fileUrl(files.passportFile)) documents.passportFile = fileUrl(files.passportFile);
+ if (fileUrl(files.dlFile)) documents.dlFile = fileUrl(files.dlFile);
+ if (fileUrl(files.otherDocFile)) documents.otherDocFile = fileUrl(files.otherDocFile);
+ candidateDetails.documents = documents;
+ const updateFields = { candidateDetails, status: req.body.status || 'candidate-details', updatedAt: new Date() };
+ const result = await req.db.collection(WORKORDER_COLLECTION).findOneAndUpdate({ _id: new ObjectId(id) }, { $set: updateFields }, { returnDocument: 'after' });
+ const updated = result?.value || result;
+ if (!updated) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ res.json({ success: true, message: 'Candidate details saved.', workorder: shapeWorkorder(updated.value ? updated.value : updated) });
+ } catch (error) { console.error('Save Candidate Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.post(`${API_BASE}/workorders/:id/send-invite`, async (req, res) => {
+ try {
+ const { id } = req.params;
+ if (!isValidId(id)) return res.status(400).json({ success: false, message: 'Invalid workorder id.' });
+ const wo = await req.db.collection(WORKORDER_COLLECTION).findOne({ _id: new ObjectId(id) });
+ if (!wo) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ if ((wo.initiationMode || 'Candidate') !== 'Candidate') return res.json({ success: true, skipped: true, message: 'Initiation mode is "Verifitech" — no candidate invite needed.' });
+ const email = req.body.email || wo.email;
+ const fullName = req.body.fullName || wo.fullName;
+ const emailResult = await sendCandidateInviteEmail({ to: email, fullName, bgvRef: wo.bgvRef, workorderId: id });
+ res.json({ success: !!emailResult.success, message: emailResult.success ? 'Invite email sent successfully.' : 'Failed to send invite email.', emailResult });
+ } catch (error) { console.error('Send Invite Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.delete(`${API_BASE}/workorders/:id`, async (req, res) => {
+ try {
+ const { id } = req.params;
+ if (!isValidId(id)) return res.status(400).json({ success: false, message: 'Invalid workorder id.' });
+ const deleteResult = await req.db.collection(WORKORDER_COLLECTION).deleteOne({ _id: new ObjectId(id) });
+ if (deleteResult.deletedCount === 0) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ const [assignmentDelete, insufficiencyDelete] = await Promise.all([req.db.collection(ASSIGNMENT_COLLECTION).deleteMany({ workorderId: id }), req.db.collection(INSUFFICIENCY_COLLECTION).deleteMany({ workorderId: id })]);
+ res.json({ success: true, message: 'Workorder and related assignment records deleted successfully.', deletedAssignments: assignmentDelete.deletedCount, deletedInsufficiencies: insufficiencyDelete.deletedCount });
+ } catch (error) { console.error('Delete Workorder Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.get(`${API_BASE}/package-checks`, async (req, res) => {
+ try {
+ const name = (req.query.name || '').trim(); const code = (req.query.code || '').trim();
+ if (!name && !code) return res.status(400).json({ success: false, message: 'Package name or code is required.' });
+ const query = name ? { name } : { code };
+ const pkg = await req.db.collection(PACKAGE_COLLECTION).findOne(query);
+ if (!pkg) return res.status(404).json({ success: false, message: `Package "${name || code}" not found.`, checks: [] });
+ let checkCodes = [];
+ if (Array.isArray(pkg.checks) && pkg.checks.length) checkCodes = pkg.checks.filter(Boolean);
+ else if (Array.isArray(pkg.checkComponents) && pkg.checkComponents.length) checkCodes = pkg.checkComponents.map((c) => typeof c === 'string' ? c : c.code || c.checkCode || c.checkType || c.checkTypeCode).filter(Boolean);
+ if (!checkCodes.length) return res.json({ success: true, package: { id: pkg._id.toString(), name: pkg.name, code: pkg.code }, checks: [] });
+ const masters = await req.db.collection(CHECKTYPE_COLLECTION).find({ code: { $in: checkCodes } }).toArray();
+ const byCode = new Map(masters.map((m) => [m.code, m]));
+ const checks = checkCodes.map((c) => byCode.get(c)).filter(Boolean).map(shapeCheckFromMaster).filter(Boolean);
+ res.json({ success: true, package: { id: pkg._id.toString(), name: pkg.name, code: pkg.code, description: pkg.description || '' }, checks });
+ } catch (error) { console.error('Resolve Package Checks Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+/* ####################################################################
+ ## SHARED: CHECK HOLD / CASE HOLD / STOP (NO TIME RESTRICTION) ##
+ #################################################################### */
+
+router.put(`${API_BASE}/workorders/:id/checks/:slNo/hold`, async (req, res) => {
+ try {
+ const { id, slNo } = req.params; const { reason, raisedBy } = req.body;
+ if (!isValidId(id)) return res.status(400).json({ success: false, message: 'Invalid workorder id.' });
+ if (!reason || !reason.trim()) return res.status(400).json({ success: false, message: 'A reason for the hold is required.' });
+ const wo = await req.db.collection(WORKORDER_COLLECTION).findOne({ _id: new ObjectId(id) });
+ if (!wo) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ const checks = Array.isArray(wo.checks) ? wo.checks : [];
+ const idx = checks.findIndex((c) => String(c.slNo) === String(slNo));
+ if (idx === -1) return res.status(404).json({ success: false, message: 'Check not found.' });
+ const now = new Date();
+ const holdPreviousStatus = checks[idx].status || 'assignment-pending';
+ checks[idx] = { ...checks[idx], holdPreviousStatus, status: 'hold', holdReason: reason.trim(), holdRaisedAt: now, holdClearedAt: null, holdRaisedBy: raisedBy || null };
+ const result = await req.db.collection(WORKORDER_COLLECTION).findOneAndUpdate({ _id: new ObjectId(id) }, { $set: { checks, updatedAt: now } }, { returnDocument: 'after' });
+ const updated = result?.value || result;
+ sendCheckHoldNotification({ assigneeEmail: checks[idx].assignedToEmail, bgvRef: wo.bgvRef, candidateName: wo.fullName, checkType: checks[idx].checkType, subType: checks[idx].subType, reason: reason.trim() }).catch((e) => console.error('Check hold email failed:', e.message));
+ if (raisedBy?.origin === 'client') {
+ (async () => {
+ try {
+ const clientDoc = await findClientDoc(req.db, wo.client);
+ const supporterEmail = clientDoc ? await findSupporterEmail(req.db, clientDoc.customerSupporter) : '';
+ await sendCheckHoldNotification({ supporterEmail, bgvRef: wo.bgvRef, candidateName: wo.fullName, checkType: checks[idx].checkType, subType: checks[idx].subType, reason: reason.trim() });
+ } catch (e) { console.error('Client check hold supporter email failed:', e.message); }
+ })();
+ }
+ res.json({ success: true, message: 'Check put on hold.', workorder: shapeWorkorder(updated.value ? updated.value : updated) });
+ } catch (error) { console.error('Workorder Check Hold Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.put(`${API_BASE}/workorders/:id/checks/:slNo/hold/clear`, async (req, res) => {
+ try {
+ const { id, slNo } = req.params;
+ if (!isValidId(id)) return res.status(400).json({ success: false, message: 'Invalid workorder id.' });
+ const wo = await req.db.collection(WORKORDER_COLLECTION).findOne({ _id: new ObjectId(id) });
+ if (!wo) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ const checks = Array.isArray(wo.checks) ? wo.checks : [];
+ const idx = checks.findIndex((c) => String(c.slNo) === String(slNo));
+ if (idx === -1) return res.status(404).json({ success: false, message: 'Check not found.' });
+ const now = new Date();
+ const restoredStatus = checks[idx].holdPreviousStatus || 'assignment-pending';
+ checks[idx] = { ...checks[idx], status: restoredStatus, holdClearedAt: now };
+ const result = await req.db.collection(WORKORDER_COLLECTION).findOneAndUpdate({ _id: new ObjectId(id) }, { $set: { checks, updatedAt: now } }, { returnDocument: 'after' });
+ const updated = result?.value || result;
+ res.json({ success: true, message: 'Check hold cleared.', workorder: shapeWorkorder(updated.value ? updated.value : updated) });
+ } catch (error) { console.error('Workorder Clear Check Hold Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.put(`${API_BASE}/workorders/:id/case-hold`, async (req, res) => {
+ try {
+ const { id } = req.params; const { reason, raisedBy } = req.body;
+ if (!isValidId(id)) return res.status(400).json({ success: false, message: 'Invalid workorder id.' });
+ if (!reason || !reason.trim()) return res.status(400).json({ success: false, message: 'A reason for the case hold is required.' });
+ const wo = await req.db.collection(WORKORDER_COLLECTION).findOne({ _id: new ObjectId(id) });
+ if (!wo) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ if (wo.status === 'on-hold') return res.status(400).json({ success: false, message: 'This case is already on hold.' });
+ const now = new Date();
+ const casePreviousStatus = wo.status || 'draft';
+ const result = await req.db.collection(WORKORDER_COLLECTION).findOneAndUpdate({ _id: new ObjectId(id) }, { $set: { casePreviousStatus, status: 'on-hold', caseHoldReason: reason.trim(), caseHoldRaisedAt: now, caseHoldClearedAt: null, caseHoldRaisedBy: raisedBy || null, updatedAt: now } }, { returnDocument: 'after' });
+ const updated = result?.value || result;
+ (async () => {
+ try {
+ const clientDoc = await findClientDoc(req.db, wo.client);
+ const supporterEmail = clientDoc ? await findSupporterEmail(req.db, clientDoc.customerSupporter) : '';
+ await sendCaseHoldNotification({ supporterEmail, bgvRef: wo.bgvRef, candidateName: wo.fullName, clientName: clientDoc?.companyName || wo.client, reason: reason.trim() });
+ } catch (e) { console.error('Case hold email failed:', e.message); }
+ })();
+ res.json({ success: true, message: 'Case put on hold. Every check on this workorder is paused.', workorder: shapeWorkorder(updated.value ? updated.value : updated) });
+ } catch (error) { console.error('Workorder Case Hold Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.put(`${API_BASE}/workorders/:id/case-hold/clear`, async (req, res) => {
+ try {
+ const { id } = req.params;
+ if (!isValidId(id)) return res.status(400).json({ success: false, message: 'Invalid workorder id.' });
+ const wo = await req.db.collection(WORKORDER_COLLECTION).findOne({ _id: new ObjectId(id) });
+ if (!wo) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ const now = new Date();
+ const restoredStatus = wo.casePreviousStatus || 'draft';
+ const result = await req.db.collection(WORKORDER_COLLECTION).findOneAndUpdate({ _id: new ObjectId(id) }, { $set: { status: restoredStatus, caseHoldClearedAt: now, updatedAt: now } }, { returnDocument: 'after' });
+ const updated = result?.value || result;
+ res.json({ success: true, message: 'Case hold cleared.', workorder: shapeWorkorder(updated.value ? updated.value : updated) });
+ } catch (error) { console.error('Workorder Clear Case Hold Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.get(`${API_BASE}/workorders/:id/payment-policy`, async (req, res) => {
+ try {
+ const { id } = req.params;
+ if (!isValidId(id)) return res.status(400).json({ success: false, message: 'Invalid workorder id.' });
+ const wo = await req.db.collection(WORKORDER_COLLECTION).findOne({ _id: new ObjectId(id) });
+ if (!wo) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ const paymentDue = isPaymentDue(wo.createdAt);
+ res.json({ success: true, paymentDue, note: paymentPolicyNote(paymentDue), graceWindowExpiresAt: paymentGraceExpiresAt(wo.createdAt) });
+ } catch (error) { console.error('Payment Policy Preview Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+router.put(`${API_BASE}/workorders/:id/checks/:slNo/stop`, async (req, res) => {
+ try {
+ const { id, slNo } = req.params; const { reason, stoppedBy } = req.body;
+ if (!isValidId(id)) return res.status(400).json({ success: false, message: 'Invalid workorder id.' });
+ const wo = await req.db.collection(WORKORDER_COLLECTION).findOne({ _id: new ObjectId(id) });
+ if (!wo) return res.status(404).json({ success: false, message: 'Workorder not found.' });
+ const checks = Array.isArray(wo.checks) ? wo.checks : [];
+ const idx = checks.findIndex((c) => String(c.slNo) === String(slNo));
+ if (idx === -1) return res.status(404).json({ success: false, message: 'Check not found.' });
+ if (checks[idx].stopped) return res.status(400).json({ success: false, message: 'This check has already been stopped.' });
+ const now = new Date();
+ const paymentDue = isPaymentDue(wo.createdAt);
+ checks[idx] = { ...checks[idx], stopped: true, stoppedAt: now, stopReason: (reason || '').trim(), stoppedBy: stoppedBy || null, paymentDue, previousStatusBeforeStop: checks[idx].status || 'assignment-pending', status: 'stopped' };
+ const result = await req.db.collection(WORKORDER_COLLECTION).findOneAndUpdate({ _id: new ObjectId(id) }, { $set: { checks, updatedAt: now } }, { returnDocument: 'after' });
+ const updated = result?.value || result;
+ if (stoppedBy?.origin === 'client') {
+ (async () => {
+ try {
+ const clientDoc = await findClientDoc(req.db, wo.client);
+ const supporterEmail = clientDoc ? await findSupporterEmail(req.db, clientDoc.customerSupporter) : '';
+ await sendStopCheckNotification({ supporterEmail, clientName: clientDoc?.companyName || wo.client, bgvRef: wo.bgvRef, candidateName: wo.fullName, checkType: checks[idx].checkType, reason: (reason || '').trim() });
+ } catch (e) { console.error('Client stop check supporter email failed:', e.message); }
+ })();
+ }
+ res.json({ success: true, message: 'Check stopped.', workorder: shapeWorkorder(updated.value ? updated.value : updated) });
+ } catch (error) { console.error('Workorder Check Stop Error:', error); res.status(500).json({ success: false, message: error.message }); }
+});
+
+/* ####################################################################
+ ## BULK UPLOAD  (FIXED — supports frontend VT_Bulk_Workorder_Template)
+ ####################################################################
+  FIXES:
+  #1  Column mapping: frontend template uses `candidateName`, `emailId`,
+      `phoneNumber`, `fatherName`, etc. with YES/NO flags per check.
+      Backend previously expected `firstName`/`lastName`/`email`/`phone`
+      + comma-separated `checkTypes` — so EVERY row failed validation.
+      Now we detect the template shape and map columns accordingly.
+  #2  Origin & client context: frontend sends `origin=client`,
+      `clientCode`, `companyName`, `clientId`, `portalEmail`,
+      `uploadedBy`, `uploadedByName`. Backend ignored all of these and
+      hard-coded `origin: 'employee'`. Now `buildCreatedBy` reads the
+      FormData body, so client-uploaded workorders show up in the
+      client's own dashboard filter.
+  #3  File-size limit raised 5MB → 10MB to match frontend cap.
+  #4  Response now returns `total` and `workorderIds` (array of ids)
+      so the frontend result panel renders correct counts.
+ #################################################################### */
+
+// ---- Column aliases: frontend-template-name  →  internal-field-name ----
+const COLUMN_ALIASES = {
+ candidateName: 'fullName',
+ emailId:       'email',
+ phoneNumber:   'phone',
+ fatherName:    'fatherName',
+ gender:        'gender',
+ dob:           'dob',
+ placeOfJoin:   'placeOfJoin',
+};
+
+// ---- YES/NO check-flag → { checkType, subType } mapping ----
+//   Mirrors the 32-column VT_Bulk_Workorder_Template produced by the
+//   frontend BulkUploadModal.TEMPLATE_HEADERS.
+const CHECK_FLAG_MAP = {
+ isAddressPresentRequired:      { checkType: 'Address',          subType: 'Present Address' },
+ isAddressPermanentRequired:    { checkType: 'Address',          subType: 'Permanent Address' },
+ isEducationPgRequired:         { checkType: 'Education',        subType: 'PG' },
+ isEducationUgRequired:         { checkType: 'Education',        subType: 'UG' },
+ isEducationDiplomaRequired:    { checkType: 'Education',        subType: 'Diploma' },
+ isEducation12thRequired:       { checkType: 'Education',        subType: '12th' },
+ isEducation10thRequired:       { checkType: 'Education',        subType: '10th' },
+ isEmploymentLatestRequired:    { checkType: 'Employment',       subType: 'Latest Employment' },
+ isCriminalPresentRequired:     { checkType: 'Criminal',         subType: 'Present Address' },
+ isCriminalPermanentRequired:   { checkType: 'Criminal',         subType: 'Permanent Address' },
+ isCourtPresentRequired:        { checkType: 'Court',            subType: 'Present Address' },
+ isCourtPermanentRequired:      { checkType: 'Court',            subType: 'Permanent Address' },
+ isDrugPanel10Required:         { checkType: 'Drug Test',        subType: '10 Panel' },
+ isDrugPanel5Required:          { checkType: 'Drug Test',        subType: '5 Panel' },
+ isDrugPanel4Required:          { checkType: 'Drug Test',        subType: '4 Panel' },
+ isDrugPanel3Required:          { checkType: 'Drug Test',        subType: '3 Panel' },
+ isDrugPanel2Required:          { checkType: 'Drug Test',        subType: '2 Panel' },
+ isIdPanCardRequired:           { checkType: 'ID Verification',  subType: 'PAN Card' },
+ isIdDrivingLicenseRequired:    { checkType: 'ID Verification',  subType: 'Driving License' },
+ isIdVoterIdRequired:           { checkType: 'ID Verification',  subType: 'Voter ID' },
+ isIdAadharIdRequired:          { checkType: 'ID Verification',  subType: 'Aadhaar' },
+ isIdPassportIdRequired:        { checkType: 'ID Verification',  subType: 'Passport' },
+};
+
+const isYes = (v) => {
+ const s = String(v || '').trim().toLowerCase();
+ return s === 'yes' || s === 'y' || s === 'true' || s === '1';
+};
+
+// Normalise a raw spreadsheet row into a canonical object that both
+// the legacy and the new VT template can produce.
+const normalizeRow = (raw) => {
+ const out = {};
+ Object.keys(raw || {}).forEach((key) => {
+ const canonical = COLUMN_ALIASES[key] || key;
+ const val = raw[key];
+ // keep both the canonical and the original key so downstream code
+ // that may still reference the old names keeps working.
+ out[canonical] = val;
+ if (key !== canonical) out[key] = val;
+ });
+ return out;
+};
+
+// Helper: parse CSV or XLSX buffer into array of row-objects using XLSX
+function parseSpreadsheetBuffer(buffer, originalName) {
+ const workbook = XLSX.read(buffer, { type: 'buffer' });
+ const sheetName = workbook.SheetNames[0];
+ if (!sheetName) return [];
+ return XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: '' });
+}
+
+// GET /api/workorder-assignment/bulk/template
+//   Updated to mirror the frontend XLSX template headers so a file
+//   downloaded from either source is accepted by the POST below.
+router.get(`${API_BASE}/workorder-assignment/bulk/template`, (req, res) => {
+ const headers = [
+ 'candidateName', 'fatherName', 'emailId', 'gender', 'dob', 'phoneNumber', 'placeOfJoin',
+ 'isAddressPresentRequired', 'isAddressPermanentRequired',
+ 'isEducationPgRequired', 'isEducationUgRequired', 'isEducationDiplomaRequired',
+ 'isEducation12thRequired', 'isEducation10thRequired', 'isEmploymentLatestRequired',
+ 'totalEmploymentToBeVerify', 'isCriminalPresentRequired', 'isCriminalPermanentRequired',
+ 'isCourtPresentRequired', 'isCourtPermanentRequired', 'numberOfReferences',
+ 'isDrugPanel10Required', 'isDrugPanel5Required', 'isDrugPanel4Required',
+ 'isDrugPanel3Required', 'isDrugPanel2Required', 'isIdPanCardRequired',
+ 'isIdDrivingLicenseRequired', 'isIdVoterIdRequired', 'isIdAadharIdRequired',
+ 'isIdPassportIdRequired',
+ ];
+ const sampleRow = [
+ 'John Doe', 'Robert Doe', 'john.doe@example.com', 'Male', '1990-01-15', '9876543210', 'Mumbai',
+ 'Yes', 'Yes', 'No', 'Yes', 'No', 'Yes', 'Yes', 'Yes', 2,
+ 'Yes', 'Yes', 'No', 'No', 0,
+ 'No', 'No', 'No', 'No', 'No', 'Yes',
+ 'No', 'No', 'Yes', 'No',
+ ];
+ res.setHeader('Content-Type', 'text/csv');
+ res.setHeader('Content-Disposition', 'attachment; filename=VT_Bulk_Workorder_Template.csv');
+ res.send(headers.join(',') + '\n' + sampleRow.join(',') + '\n');
+});
+
+// POST /api/workorder-assignment/bulk
+router.post(`${API_BASE}/workorder-assignment/bulk`, bulkUpload.single('file'), async (req, res) => {
+ try {
+ if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded.' });
+
+ const rawRows = parseSpreadsheetBuffer(req.file.buffer, req.file.originalname);
+ if (!rawRows || rawRows.length === 0) return res.status(400).json({ success: false, message: 'File is empty or has no data rows.' });
+ if (rawRows.length > 500) return res.status(400).json({ success: false, message: 'Maximum 500 rows per upload.' });
+
+ // Normalise every row so both legacy & new template columns resolve
+ // to the same canonical field names (fullName, email, phone ...).
+ const rows = rawRows.map(normalizeRow);
+
+ // FIX #2: read client context out of the FormData body that the
+ // frontend BulkUploadModal sends.  These fields drive createdBy
+ // and the workorder's `client` so client-origin workorders appear
+ // in the client's dashboard filter.
+ const body = req.body || {};
+ const origin = (body.origin || '').toString().trim().toLowerCase() === 'client' ? 'client' : 'employee';
+ const clientCode    = (body.clientCode || '').toString().trim();
+ const companyName   = (body.companyName || '').toString().trim();
+ const clientId      = (body.clientId || '').toString().trim();
+ const portalEmail   = (body.portalEmail || body.uploadedBy || '').toString().trim();
+ const uploadedByName = (body.uploadedByName || companyName || '').toString().trim();
+ const uploadedBy    = (body.uploadedBy || portalEmail || '').toString().trim();
+
+ // Determine required fields based on detected template shape.
+ // New template: candidateName + emailId/phoneNumber + per-check flags
+ // Legacy template: firstName + lastName + email + phone + checkTypes
+ const hasNewTemplateCols = rows.some((r) => r.candidateName || r.emailId || r.phoneNumber);
+
+ const requiredCols = hasNewTemplateCols
+   ? ['candidateName', 'email', 'phone']          // client & packageName come from FormData context
+   : ['firstName', 'lastName', 'email', 'phone', 'client', 'packageName'];
+
+ const errors = [];
+ const created = [];
+ const seenEmails = new Set();
+
+ // Load check-type name→id map (used for both shapes)
+ let checkTypeMap = {};
+ try {
+ const checkTypes = await req.db.collection(CHECKTYPE_COLLECTION).find({}).toArray();
+ checkTypes.forEach((ct) => {
+ const id = ct._id ? ct._id.toString() : '';
+ if (!id) return;
+ const name = (ct.name || '').toLowerCase().trim();
+ const nameCompact = name.replace(/\s+/g, '');
+ const code = (ct.code || '').toLowerCase().trim();
+ if (name) { checkTypeMap[name] = id; checkTypeMap[nameCompact] = id; }
+ if (code) checkTypeMap[code] = id;
+ });
+ } catch (e) { console.warn('Bulk upload: could not load check types:', e.message); }
+
+ for (let i = 0; i < rows.length; i++) {
+ const row = rows[i];
+ const rowNum = i + 2; // header is row 1
+
+ const missing = requiredCols.filter((col) => !row[col] || !String(row[col]).trim());
+ if (missing.length > 0) { errors.push({ row: rowNum, message: `Missing: ${missing.join(', ')}` }); continue; }
+
+ const email = String(row.email).trim();
+ if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { errors.push({ row: rowNum, message: `Invalid email: ${email}` }); continue; }
+
+ const emailLower = email.toLowerCase();
+ if (seenEmails.has(emailLower)) { errors.push({ row: rowNum, message: `Duplicate email in this file: ${email}` }); continue; }
+ seenEmails.add(emailLower);
+
+ const phone = String(row.phone || '').trim();
+ const candidateNameStr = String(row.candidateName || '').trim();
+
+ // Split candidateName into first/last for legacy-shape compatibility
+ let firstName, lastName;
+ if (hasNewTemplateCols) {
+ const parts = candidateNameStr.split(/\s+/);
+ firstName = parts[0] || '';
+ lastName  = parts.slice(1).join(' ') || '';
+ } else {
+ firstName = String(row.firstName || '').trim();
+ lastName  = String(row.lastName || '').trim();
+ }
+
+ const candidateDetails = {
+ personal: {
+ firstName, lastName, fatherName: String(row.fatherName || '').trim(),
+ motherName: String(row.motherName || '').trim(), email, gender: String(row.gender || '').trim(), dob: String(row.dob || '').trim(),
+ maritalStatus: String(row.maritalStatus || '').trim(), nationality: String(row.nationality || 'Indian').trim(),
+ aadhaarNumber: String(row.aadhaarNumber || '').trim(), mobile: phone, altMobile: String(row.altMobile || '').trim(),
+ bloodGroup: String(row.bloodGroup || '').trim(), isFresher: String(row.isFresher || '').trim(), isExServiceman: String(row.isExServiceman || '').trim(),
+ physicallyChallenged: String(row.physicallyChallenged || '').toLowerCase() === 'yes', disabilityDetails: String(row.disabilityDetails || '').trim(),
+ chronicCondition: String(row.chronicCondition || '').toLowerCase() === 'yes', chronicConditionDetails: String(row.chronicConditionDetails || '').trim(),
+ },
+ secondaryContacts: [],
+ additional: {
+ panNumber: String(row.panNumber || '').trim(), nameOnPan: String(row.nameOnPan || '').trim(),
+ drivingLicenseNo: String(row.drivingLicenseNo || '').trim(), voterId: String(row.voterId || '').trim(),
+ passportNumber: String(row.passportNumber || '').trim(), uanNumber: String(row.uanNumber || '').trim(),
+ },
+ address: {
+ currentAddress: String(row.currentAddress || '').trim(), currentCity: String(row.currentCity || '').trim(),
+ currentState: String(row.currentState || '').trim(), pinCode: String(row.pinCode || '').trim(),
+ country: String(row.country || 'India').trim(), sameAsCurrent: false,
+ permanentAddress: String(row.permanentAddress || '').trim(), permanentCity: String(row.permanentCity || '').trim(),
+ permanentState: String(row.permanentState || '').trim(), permanentPinCode: String(row.permanentPinCode || '').trim(),
+ },
+ education: [], employment: [], documents: {},
+ };
+
+ // Build checks — two strategies depending on template shape.
+ const checks = [];
+ if (hasNewTemplateCols) {
+ // Strategy A: derive from YES/NO per-check flags (VT template)
+ Object.keys(CHECK_FLAG_MAP).forEach((flagCol) => {
+ if (isYes(row[flagCol])) {
+ const spec = CHECK_FLAG_MAP[flagCol];
+ const key = spec.checkType.toLowerCase().trim();
+ const keyCompact = key.replace(/\s+/g, '');
+ const ctId = checkTypeMap[key] || checkTypeMap[keyCompact] || '';
+ checks.push(normalizeCheck({
+ checkType: spec.checkType, checkTypeId: ctId, subType: spec.subType,
+ status: 'assignment-pending',
+ }, checks.length));
+ }
+ });
+
+ // Employment count (totalEmploymentToBeVerify)
+ const empCount = parseInt(row.totalEmploymentToBeVerify, 10);
+ if (!isNaN(empCount) && empCount > 0) {
+ const already = checks.some((c) => c.checkType === 'Employment');
+ const key = 'employment';
+ const ctId = checkTypeMap[key] || '';
+ if (!already) {
+ checks.push(normalizeCheck({
+ checkType: 'Employment', checkTypeId: ctId, subType: 'Latest Employment',
+ count: empCount, status: 'assignment-pending',
+ }, checks.length));
+ } else {
+ // bump count on the existing Employment check
+ const idx = checks.findIndex((c) => c.checkType === 'Employment');
+ if (idx >= 0) checks[idx].count = empCount;
+ }
+ }
+
+ // Reference checks (numberOfReferences is a count, not a flag)
+ const refCount = parseInt(row.numberOfReferences, 10);
+ if (!isNaN(refCount) && refCount > 0) {
+ const key = 'reference';
+ const ctId = checkTypeMap[key] || checkTypeMap['referencecheck'] || '';
+ checks.push(normalizeCheck({
+ checkType: 'Reference', checkTypeId: ctId, subType: '',
+ count: refCount, status: 'assignment-pending',
+ }, checks.length));
+ }
+ } else {
+ // Strategy B: legacy comma-separated checkTypes column
+ const checkTypesStr = String(row.checkTypes || '').trim();
+ if (checkTypesStr) {
+ const typeNames = checkTypesStr.split(',').map((s) => s.trim()).filter(Boolean);
+ for (const typeName of typeNames) {
+ const key = typeName.toLowerCase().trim();
+ const keyCompact = key.replace(/\s+/g, '');
+ const ctId = checkTypeMap[key] || checkTypeMap[keyCompact] || '';
+ checks.push(normalizeCheck({
+ checkType: typeName, checkTypeId: ctId || '', status: 'assignment-pending',
+ }, checks.length));
+ }
+ }
+ }
+
+ if (checks.length === 0) {
+ errors.push({ row: rowNum, message: 'No checks selected — enable at least one check flag.' });
+ continue;
+ }
+
+ const bgvRef = await generateBgvRef(req.db);
+ const now = new Date();
+
+ // FIX #2: build createdBy from the FormData context so client
+ // uploads are stamped with origin=client + clientCode/portalEmail,
+ // which the DashboardContent / TrackCaseDashboard filters rely on.
+ const createdBy = buildCreatedBy({
+ origin,
+ clientCode,
+ clientId,
+ portalEmail,
+ name: uploadedByName,
+ email: uploadedBy,
+ }, origin);
+
+ // Resolve client field — prefer FormData companyName, then row.client
+ const clientField = (hasNewTemplateCols ? (companyName || String(row.client || '').trim()) : String(row.client || '').trim());
+
+ const doc = {
+ ...buildWorkorderDoc({
+ fullName: `${firstName} ${lastName}`.trim() || candidateNameStr, email, phone,
+ client: clientField, branch: String(row.branch || '').trim(),
+ packageName: String(row.packageName || '').trim(),
+ priority: String(row.priority || 'Standard').trim(), clientRef: String(row.clientRef || clientCode || '').trim(),
+ initiationMode: 'Bulk Upload', status: 'candidate-details', checks, candidateDetails,
+ }),
+ bgvRef, createdBy, origin, createdAt: now, updatedAt: now,
+ };
+
+ try {
+ const result = await req.db.collection(WORKORDER_COLLECTION).insertOne(doc);
+ if (result.insertedId) {
+ created.push({ _id: result.insertedId.toString(), bgvRef, email });
+ // Notify supporter for client-origin uploads
+ if (origin === 'client') {
+ notifySupporterOfNewWorkorder(req.db, { clientRef: clientField, bgvRef, candidateName: doc.fullName, workorderId: result.insertedId.toString() });
+ }
+ }
+ } catch (dbErr) {
+ let msg = dbErr.message;
+ if (dbErr.code === 11000) { const field = Object.keys(dbErr.keyValue || {})[0] || 'field'; msg = `Duplicate value for ${field}`; }
+ errors.push({ row: rowNum, message: msg });
+ }
+ }
+
+ // FIX #4: include `total` and `workorderIds` so the frontend
+ // BulkUploadModal renders accurate counts in the result panel.
+ return res.status(200).json({
+ success: true,
+ message: `Processed ${rows.length} rows: ${created.length} created, ${errors.length} failed`,
+ total: rows.length,
+ created: created.length,
+ failed: errors.length,
+ errors,
+ workorderIds: created.map((w) => w._id),
+ workorders: created.map((w) => w._id), // kept for backward compat
+ });
+ } catch (err) {
+ console.error('Bulk upload error:', err);
+ return res.status(500).json({ success: false, message: err.message || 'Internal server error during bulk upload.' });
+ }
+});
+
+module.exports = router;
